@@ -14,7 +14,7 @@ races, both regions. Rendering through PCSX2's hardware GS (D3D11), audio throug
   garbage first output line/column (1-pixel presentation crop).
 * Glitch sweep: attract-mode demos on six tracks (USA + EU), menus, profile flow, a full lap on Rocky Mountain Trail:
   no rendering faults seen.
-* Open: frame rates above 60 (`CNR_FPS`, experimental: the race countdown never starts); world-anchored 2D markers
+* Open: frame rates above 60 (`CNR_FPS`, experimental: races run at full speed but crash intermittently); world-anchored 2D markers
   sit slightly off in 16:9; a "WRONG WAY" sign was once captured without its text (not reproduced, may be its blink).
 
 ## IOP side (IOPMAIN.IRX, the game's own module)
@@ -163,9 +163,25 @@ world takes that step at race load (0x177ED4).
 
 * Without changes, a higher vblank rate runs the game faster (one 1/60 step per frame): 90 Hz measured 1.45x.
 * With the rate globals set to the new rate (what `CNR_FPS` does, re-applied every frame from the `sceGsSyncV` hook),
-  menus, loading and the race fly-by keep real-time speed at 90/100/120 Hz (frames: 88/100/117 per second), but in the
-  race the karts then wait on the grid forever: the countdown never starts. Not resolved; candidates are the physics
-  world's settle/start logic at a smaller step. Until then 60 Hz (EU 50) is the supported rate.
+  menus, loading and the race fly-by keep real-time speed.
+* Race countdown (fixed): the race intro state (vtable 0x4EF4B0, update FUN_001cc3f8, state at +0x254) starts the
+  countdown (virtual slot 46, FUN_0015e6c8) once FUN_00300260 reports every HUD widget's intro animation finished. The
+  minimap's fade-in never finished: the HUD script loader FUN_00305340 stores a fade as a whole alpha step per simulation
+  step, (int)(alphaMax / (duration / step)) at widget +0x36B, which is 1 at 60 Hz and truncates to 0 at 90/120 Hz, so the
+  fade (FUN_00303848, EU 0x303780; alpha +0x368 towards +0x369) never moved. With `CNR_FPS` a zero step on an active fade
+  becomes 1 (`fadeHook`): the minimap fades in up to 2x faster, the countdown starts.
+* Speed (fixed): FUN_003831f8 (EU 0x383188) caps a frame at 2 simulation steps; frames longer than that lose the excess.
+  At 60 Hz that is 2/60 s (the game clock 0x4C5658 still loses ~1.7% to occasional 3+-vblank hitches, as the original
+  would); at 120 Hz the same cap lost ~4%. With `CNR_FPS` the function is replaced (`stepCount`) with the cap scaled to
+  keep 2/60 s: game clock 10.009 s per 10 s at 120 Hz.
+* OPEN: races at 90/120 Hz crash intermittently (about 1 in 3 two-lap races at 120 Hz, first try at 90 Hz): the effect
+  node clone FUN_0033ffa0 gets 0 from the game allocator (0x22A840) for a child list and constructs at address 0 (call
+  to 0 at 0x340098). The heap (0x44E000-0x1F00000, ~26.3 MB of 27.9 MB in use in races at both rates) runs out; the
+  likely cause is effects spawned per simulation step (template 0xB91560 is cloned continually), so more are alive at a
+  higher rate. One run also jumped to 0x148 near the race end. Not seen at 60 Hz (400 s races). Next: find the spawner
+  and scale its rate, or rate-limit clones of the same template.
+* Debug aids from this: `CNR_RAMDUMP=<s>,<s>` (EE RAM to build/runs/ram_<s>.bin), scripts/xref.py (code that builds an
+  address), scripts/vtable.py.
 * The runtime's automatic EE cycle scale (60 / vblank rate) is needed: with `PS2X_EE_CYCLE_SCALE=1` frames span
   several vblanks at 90 Hz.
 

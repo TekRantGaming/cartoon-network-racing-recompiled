@@ -47,6 +47,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -291,6 +292,31 @@ int main(int argc, char *argv[])
                 nextHeartbeat += std::chrono::seconds(5);
                 std::cout << "[cnr] t=" << std::chrono::duration_cast<std::chrono::seconds>(now - start).count()
                           << "s frames=" << cnrGsFrameCount() << std::endl;
+            }
+            // CNR_RAMDUMP=<s>[,<s>...]: write EE RAM to build/runs/ram_<s>.bin at those times (debugging; not synchronised).
+            static std::vector<int> ramDumps = []() {
+                std::vector<int> v;
+                if (const char *e = std::getenv("CNR_RAMDUMP"))
+                    for (const char *p = e; *p;)
+                    {
+                        v.push_back(std::atoi(p));
+                        while (*p && *p != ',')
+                            ++p;
+                        if (*p == ',')
+                            ++p;
+                    }
+                return v;
+            }();
+            if (!ramDumps.empty() && now - start >= std::chrono::seconds(ramDumps.front()))
+            {
+                const std::string name = "build/runs/ram_" + std::to_string(ramDumps.front()) + ".bin";
+                if (FILE *f = std::fopen(name.c_str(), "wb"))
+                {
+                    std::fwrite(runtime.memory().getRDRAM(), 1, 32u << 20, f);
+                    std::fclose(f);
+                }
+                std::cout << "[cnr] RAM dump " << name << " frames=" << cnrGsFrameCount() << std::endl;
+                ramDumps.erase(ramDumps.begin());
             }
             if (stopAfter > 0 && now - start >= std::chrono::seconds(stopAfter))
                 runtime.requestStop();

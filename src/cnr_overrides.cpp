@@ -10,12 +10,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <iostream>
+#include <string>
 
 namespace
 {
@@ -57,9 +59,8 @@ namespace
     // stores the refresh rate (50, 59.94 or 60) and 1/rate in four globals. With the vblank rate raised they are set to
     // the new rate, so a game frame still advances the game by the real time it took. The mode setup can run again
     // (display mode changes), so they are re-applied every frame.
-    // EXPERIMENTAL: the game simulates in fixed steps of seconds-per-vblank (at least one per frame, FUN_003831f8), and
-    // its physics world takes that step at race load. At 90/100/120 Hz menus, loading and the race fly-by run at the right
-    // speed, but the race then waits on the grid forever (no countdown). Without this override the race runs, too fast.
+    // The game simulates in fixed steps of seconds-per-vblank (at least one per frame, FUN_003831f8), so with these set
+    // it steps at the new rate; logic that turns durations into whole units per step needs help (fadeHook below).
     // docs/FINDINGS.md "Frame rates above 60".
     struct RateAddrs
     {
@@ -136,6 +137,59 @@ namespace
         std::memcpy(rdram + k1, &value, sizeof(value));
     }
 
+    // HUD widget fades at raised frame rates. The HUD script loader (FUN_00305340) turns a fade's duration into a whole
+    // alpha step per simulation step, (int)(alphaMax / (duration / step)) at +0x36B, and the fade (FUN_00303848, EU
+    // 0x303780) adds it until alpha (+0x368) reaches its target (+0x369). With the step at 1/120 s the minimap's fade-in
+    // step truncates from 1 to 0, the widget never reports its intro animation finished, and the race intro state never
+    // starts the countdown (karts wait on the grid forever). A zero step on a fade that still has distance to go becomes 1.
+    // Simulation steps per frame (FUN_003831f8, EU 0x383188), with CNR_FPS. The original: acc += frame time; steps =
+    // trunc(acc / step), at least 1, at most 2, the fraction kept. Frames longer than two steps lose the excess. At 60 Hz
+    // that is 2/60 s; at 120 Hz the same cap of 2 already loses time on ordinary 3-vblank hitches (race timer ~96% of
+    // real time). The cap is scaled to keep the original maximum of 2/60 s per frame.
+    struct StepAddrs
+    {
+        uint32_t fn, secondsPerStep, stepCopy, enabled, remainder;
+    };
+    constexpr StepAddrs kStepUsa{0x003831F8u, 0x0059B974u, 0x004C5670u, 0x004C5684u, 0x004C567Cu};
+    constexpr StepAddrs kStepEu{0x00383188u, 0x0059B9F4u, 0x004C5684u, 0x004C5698u, 0x004C5690u};
+    StepAddrs g_step{};
+    float g_stepCap = 2.0f;
+
+    void stepCount(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        auto rf = [rdram](uint32_t a) { float v; std::memcpy(&v, rdram + a, 4); return v; };
+        const float step = rf(g_step.secondsPerStep);
+        writeFloat(rdram, g_step.stepCopy, step);
+        int32_t steps = 1;
+        uint32_t enabled;
+        std::memcpy(&enabled, rdram + g_step.enabled, 4);
+        if (enabled != 0u)
+        {
+            float whole = 0.0f;
+            const float frac = std::modf((ctx->f[12] + rf(g_step.remainder)) / step, &whole);
+            writeFloat(rdram, g_step.remainder, frac * step);
+            whole = std::min(whole, g_stepCap);
+            steps = static_cast<int32_t>(whole);
+            if (steps == 0)
+                steps = 1;
+        }
+        setReturnS32(ctx, steps);
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    PS2Runtime::RecompiledFunction g_fadeOrig = nullptr;
+    void fadeHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        uint8_t *const w = rdram + (getRegU32(ctx, 4) & 0x01FFFFFFu);
+        uint32_t enabled, fadingIn, fadingOut;
+        std::memcpy(&enabled, w + 0x360, 4);
+        std::memcpy(&fadingIn, w + 0x394, 4);
+        std::memcpy(&fadingOut, w + 0x398, 4);
+        if (enabled && (fadingIn || fadingOut) && w[0x36B] == 0u && w[0x368] != w[0x369])
+            w[0x36B] = 1u;
+        g_fadeOrig(rdram, ctx, runtime);
+    }
+
     void apply(PS2Runtime &runtime, bool eu)
     {
         applyWidescreen(runtime, eu);
@@ -154,6 +208,12 @@ namespace
         {
             g_targetHz = static_cast<float>(std::atoi(fps));
             g_rateAddrs = eu ? kRateEu : kRateUsa;
+            const uint32_t fade = eu ? 0x00303780u : 0x00303848u;
+            if ((g_fadeOrig = runtime.lookupFunction(fade)))
+                runtime.replaceFunction(fade, &fadeHook);
+            g_step = eu ? kStepEu : kStepUsa;
+            g_stepCap = std::max(2.0f, std::round(2.0f * g_targetHz / 60.0f));
+            runtime.replaceFunction(g_step.fn, &stepCount);
         }
         if (g_frameStats || g_targetHz > 0.0f)
         {
