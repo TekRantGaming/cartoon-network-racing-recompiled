@@ -1,0 +1,25 @@
+# Game data - user supplied, never commit
+/game files/
+/extracted/
+/generated/
+*.iso
+*.ELF
+SLUS_*
+SLES_*
+
+# Build output
+/build/
+/out/
+
+# Downloaded third-party tools
+/tools/bin/
+/tools/src/
+/ghidra_projects/
+
+# Third-party trees (become submodules before publishing)
+/ext/PS2Recomp/
+/ext/pcsx2/
+/ext/kzgs/deps/
+/ext/*/build/
+*.log
+/ext/sdl3/
