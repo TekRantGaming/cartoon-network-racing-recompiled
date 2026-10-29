@@ -2,19 +2,20 @@
 
 Reverse-engineering notes and the evidence behind each runtime change. Addresses are USA unless stated.
 
-## Status (2026-10-29)
+## Status (2026-10-29, phase 2)
 
-**Playable (USA).** Cold boot → intro movies → memory card check → title → profile/name entry → Select Show → Driver
-Select → races (tested several minutes: AI opponents, positions, laps, pickups, HUD). Rendering through PCSX2's hardware
-GS (D3D11, 3x), audio through PCSX2's SPU2 (WASAPI), pad via SDL3 (XInput controller detected). Races run at full
-speed: 60 game frames/s, one vblank per frame (see "Frame pacing").
+**Playable, USA and EU.** Cold boot -> movies -> memory card check -> title -> profile (new or loaded) -> menus ->
+races, both regions. Rendering through PCSX2's hardware GS (D3D11), audio through PCSX2's SPU2 (WASAPI), SDL3 pad.
 
-**Playable (EU)** as well: `build/cnr_eu/cnr.exe --eu` runs SLES_543.06 as PAL (640x512, 50 Hz vblank, PAL CRTC
-fallbacks), through the menus into races at 50 game frames/s. The SDK library code sits at the same addresses in both
-builds, so both overrides apply unchanged; everything else is a separate recompile (`config/eu/`).
-
-Not done / not verified: memory card save/load round trip; audio has been measured (levels per scene) but
-not listened to.
+* Speed: 60 game frames/s (EU 50), one vblank per frame, in menus and races ("Frame pacing").
+* 16:9 Hor+ by default, HUD in proportion at the screen edges; 2D-only screens pillarboxed 4:3 ("Widescreen").
+* Saves: `saves/<USA|EU>/mc0` next to cnr.exe, new profile and reload verified ("Memory card saves").
+* Fixed this phase: intermittent hang on file opens, sound banks/streams loaded with the wrong size (SPU errors), the
+  garbage first output line/column (1-pixel presentation crop).
+* Glitch sweep: attract-mode demos on six tracks (USA + EU), menus, profile flow, a full lap on Rocky Mountain Trail:
+  no rendering faults seen.
+* Open: frame rates above 60 (`CNR_FPS`, experimental: the race countdown never starts); world-anchored 2D markers
+  sit slightly off in 16:9; a "WRONG WAY" sign was once captured without its text (not reproduced, may be its blink).
 
 ## IOP side (IOPMAIN.IRX, the game's own module)
 

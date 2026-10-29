@@ -92,6 +92,10 @@ namespace
         k.upscale = c.upscale > 0 ? c.upscale : std::clamp((std::max(windowHeight, 448) + 447) / 448, 1, 8);
         k.vsync = c.vsync;
         k.aspect = KzgsAspect::Ratio4_3; // wide frames: kzgsSetWideRatio
+        // The output's first native line and column are garbage/black (hidden by overscan on a TV): crop one native
+        // pixel on every side so the image stays centred.
+        for (int &c : k.crop)
+            c = 1;
         // Off: full-frame output is never deinterlaced by PCSX2's Automatic mode, and other modes shift or blur it.
         k.interlaceMode = 1;
         // PCSX2's vertex-shader sprite expansion corrupts frames on NVIDIA under D3D11.
