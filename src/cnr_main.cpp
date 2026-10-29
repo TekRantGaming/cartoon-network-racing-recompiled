@@ -18,6 +18,7 @@
 #include "cnr_gs.h"
 #include "cnr_input.h"
 #include "cnr_ipu.h"
+#include "cnr_profiler.h"
 #include "cnr_vu.h"
 
 #include "ps2_runtime.h"
@@ -28,8 +29,13 @@
 #include <SDL3/SDL.h>
 #include <xmmintrin.h>
 
+#include <windows.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -97,6 +103,17 @@ int main(int argc, char *argv[])
 {
     try
     {
+        // The scheduler paces guest vblanks with OS sleeps. At Windows' default 15.6 ms timer resolution they overshoot
+        // and vblanks arrive in uneven pairs (measured: median interval 15.5 ms, p90 29 ms), so the game misses frames.
+        timeBeginPeriod(1);
+        // Windows 11 ignores that request while the process has no visible window (minimised, occluded, or the hidden
+        // CNR_HEADLESS window): idle waits then overslept a whole 15.6 ms tick and races ran at ~40 fps. Opt out.
+        PROCESS_POWER_THROTTLING_STATE throttling{};
+        throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        throttling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        throttling.StateMask = 0;
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+
         const Options opts = parseArgs(argc, argv);
         const bool headless = envOn("CNR_HEADLESS");
         const std::filesystem::path elf = std::filesystem::absolute(opts.elf).lexically_normal();
@@ -123,6 +140,14 @@ int main(int argc, char *argv[])
         else
             std::cout << "[cnr] no CD image (" << opts.iso.string() << "): raw sector reads will fail" << std::endl;
         PS2Runtime::setIoPaths(paths);
+
+        if (const char *prof = std::getenv("CNR_PROFILE"))
+        {
+            double start = 0, duration = 20;
+            std::sscanf(prof, "%lf,%lf", &start, &duration);
+            const char *out = std::getenv("CNR_PROFILE_OUT");
+            cnrStartProfiler(start, duration, out && *out ? out : "build/runs/profile.txt");
+        }
 
         cnrInputInit();
         ps2SetPadProvider(&cnrPadProvider);

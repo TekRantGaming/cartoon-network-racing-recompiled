@@ -67,6 +67,116 @@ index e5e2ffc..e8a1098 100644
          bool findImageEntry(std::string_view guestPath, ImageEntry &out)
          {
              const ParsedPs2Path parsed = parsePs2Path(guestPath);
+diff --git a/ps2xIOP/src/emulator/imports/iop_stdio.cpp b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+index eed2b61..139f486 100644
+--- a/ps2xIOP/src/emulator/imports/iop_stdio.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+@@ -4,6 +4,9 @@
+ #include "../core/iop_memory.h"
+ #include "ps2x/iop/iop_host.h"
+ 
++#include <algorithm>
++#include <cstdio>
++#include <string_view>
+ #include <string>
+ 
+ namespace ps2x::iop::detail
+@@ -13,6 +16,74 @@ namespace ps2x::iop::detail
+     {
+     }
+ 
++    namespace
++    {
++        // printf for IOP code: `nextArg` yields the variadic words in order. Handles %d %i %u %x %X %o %c %s %p %%
++        // with flags, width, precision and length modifiers (all arguments are 32-bit on the IOP).
++        template <typename NextArg>
++        std::string formatGuest(const IopMemory &memory, const std::string &fmt, NextArg nextArg)
++        {
++            std::string out;
++            for (size_t i = 0; i < fmt.size(); ++i)
++            {
++                if (fmt[i] != '%')
++                {
++                    out += fmt[i];
++                    continue;
++                }
++                size_t j = i + 1;
++                std::string spec = "%";
++                while (j < fmt.size() && std::string_view("-+ #0").find(fmt[j]) != std::string_view::npos)
++                    spec += fmt[j++];
++                while (j < fmt.size() && ((fmt[j] >= '0' && fmt[j] <= '9') || fmt[j] == '.'))
++                    spec += fmt[j++];
++                while (j < fmt.size() && (fmt[j] == 'l' || fmt[j] == 'h' || fmt[j] == 'z'))
++                    ++j;
++                if (j >= fmt.size())
++                    break;
++                const char conv = fmt[j];
++                i = j;
++                char buf[64];
++                switch (conv)
++                {
++                case '%':
++                    out += '%';
++                    break;
++                case 'd':
++                case 'i':
++                    std::snprintf(buf, sizeof(buf), (spec + "d").c_str(), static_cast<int32_t>(nextArg()));
++                    out += buf;
++                    break;
++                case 'u':
++                case 'x':
++                case 'X':
++                case 'o':
++                case 'c':
++                    std::snprintf(buf, sizeof(buf), (spec + conv).c_str(), nextArg());
++                    out += buf;
++                    break;
++                case 'p':
++                    std::snprintf(buf, sizeof(buf), "0x%x", nextArg());
++                    out += buf;
++                    break;
++                case 's':
++                {
++                    const std::string str = memory.readString(nextArg(), 512u);
++                    std::string padded(512u + 64u, char(0));
++                    const int n = std::snprintf(padded.data(), padded.size(), (spec + "s").c_str(), str.c_str());
++                    out.append(padded.data(), n > 0 ? std::min<size_t>(static_cast<size_t>(n), padded.size() - 1u) : 0u);
++                    break;
++                }
++                default:
++                    out += spec;
++                    out += conv;
++                    break;
++                }
++            }
++            return out;
++        }
++    }
++
+     bool IopStdio::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
+     {
+         const uint32_t a0 = cpu.gpr[4];
+@@ -30,9 +101,18 @@ namespace ps2x::iop::detail
+ 
+         switch (ordinal)
+         {
+-        case 4: // printf
+-            logString("[IOP printf] ", a0);
++        case 4: // printf(fmt, ...): o32 varargs in $a1-$a3, then the stack from sp+16
++        {
++            uint32_t index = 1u;
++            const uint32_t sp = cpu.gpr[29];
++            const std::string text = formatGuest(m_memory, m_memory.readString(a0, 2048u), [&]() -> uint32_t {
++                const uint32_t i = index++;
++                return i <= 3u ? cpu.gpr[4u + i] : m_memory.read32(sp + 16u + (i - 4u) * 4u);
++            });
++            m_host.log(LogLevel::Info, std::string("[IOP printf] ") + text);
++            setV0(static_cast<uint32_t>(text.size()));
+             return true;
++        }
+         case 5: // getchar
+         case 10:
+             setV0(0xFFFFFFFFu);
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
 index af75b87..2fd172b 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
@@ -439,6 +549,20 @@ index 9c0614f..bb90f27 100644
 +
 +// True when ps2SetRuntimeArena assigned a heap: the game's SetupHeap region then belongs to the game alone.
 +bool ps2RuntimeArenaActive();
+diff --git a/ps2xRuntime/include/runtime/ps2_host_vu.h b/ps2xRuntime/include/runtime/ps2_host_vu.h
+index c2e001f..faed4a8 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_vu.h
++++ b/ps2xRuntime/include/runtime/ps2_host_vu.h
+@@ -16,6 +16,9 @@ struct PS2HostVu1
+     void (*mscnt)(uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t codeGeneration, uint32_t *vpuStat) = nullptr;
+     // Optional: called once on the VIF1 worker thread before it runs its first job (per-thread host VU setup).
+     void (*bindWorkerThread)() = nullptr;
++    // Optional: VIF1 MPG wrote [addrBytes, addrBytes + bytes) of the VU1 code memory (worker thread). When set, MPG
++    // uploads report their exact range here instead of bumping the code generation (which invalidates everything).
++    void (*codeWritten)(uint32_t addrBytes, uint32_t bytes) = nullptr;
+ };
+ 
+ void ps2SetHostVu1(const PS2HostVu1 &hooks);
 diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
 index 4afdcbe..a0578d4 100644
 --- a/ps2xRuntime/include/runtime/ps2_memory.h
@@ -465,7 +589,7 @@ index 4afdcbe..a0578d4 100644
      struct PendingTransfer
      {
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index 72017a4..fbad5fa 100644
+index 72017a4..8bae9db 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -1,3 +1,4 @@
@@ -473,7 +597,28 @@ index 72017a4..fbad5fa 100644
  #include "runtime/ps2_host_gs.h"
  #include "runtime/ps2_timeline.h"
  #include <atomic>
-@@ -793,6 +794,10 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+@@ -778,6 +779,20 @@ namespace
+         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+         return static_cast<uint64_t>(static_cast<double>(ns) * 0.294912);
+     }
++
++    // hostCop0Count64() as it will read at `when`: the cycle the wall-clock floor in accountCycles reaches by then.
++    uint64_t hostCop0CountAt(std::chrono::steady_clock::time_point when)
++    {
++        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(when - std::chrono::steady_clock::now()).count();
++        const int64_t now = static_cast<int64_t>(hostCop0Count64());
++        return static_cast<uint64_t>(std::max<int64_t>(0, now + static_cast<int64_t>(static_cast<double>(ns) * 0.294912)));
++    }
++
++    // PS2X_VBLANK_CYCLE_CLAMP=0 turns off the vblank cycle-deadline clamp in processDueDeadlines.
++    const bool g_vblankCycleClamp = []() {
++        const char *v = std::getenv("PS2X_VBLANK_CYCLE_CLAMP");
++        return !(v && v[0] == '0');
++    }();
+ }
+ 
+ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+@@ -793,6 +808,10 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
      {
          wallCycles = static_cast<uint64_t>(hostCop0Count64());
          wallSampleCountdown = 63u;
@@ -484,6 +629,53 @@ index 72017a4..fbad5fa 100644
      }
      uint64_t next = m_eeCycle + std::max<uint64_t>(1u, cycles);
  #ifdef PS2X_SCHED_STATS_HOT
+@@ -2320,12 +2339,19 @@ void EeScheduler::processDueDeadlines()
+         {
+             if (scheduled.event.type == EeEventType::VBlankStart)
+             {
++                // The vblank needs both deadlines. Chained in cycles alone, its cycle deadline can drift ahead of wall
++                // time whenever the charged estimate runs fast, and the vblank then waits past its host deadline for the
++                // cycle clock. Safeguard: the next cycle deadline is never beyond the cycle the wall-clock floor reaches at
++                // the host deadline. (Cartoon Network Racing's ~40 fps races turned out to be Windows ignoring the 1 ms
++                // timer resolution for a hidden window; with that fixed in the host, this changes nothing measurable.)
++                const auto nextHost = scheduled.hostDeadline + vblankPeriod();
++                uint64_t nextCycle = scheduled.deadlineCycle + vblankPeriodCycles();
++                if (g_wallClockPacing && g_vblankCycleClamp)
++                    nextCycle = std::max(m_eeCycle + 1u, std::min(nextCycle, hostCop0CountAt(nextHost)));
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                               scheduled.hostDeadline + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+-                scheduleEvent(scheduled.deadlineCycle + vblankPeriodCycles(),
+-                              scheduled.hostDeadline + vblankPeriod(),
+-                              EeEvent{EeEventType::VBlankStart, 0, 0});
++                scheduleEvent(nextCycle, nextHost, EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);
+         }
+@@ -2506,12 +2532,21 @@ void EeScheduler::waitForEvent()
+     auto hostDeadline = std::chrono::steady_clock::time_point::max();
+     if (!m_deadlines.empty())
+     {
++        // Wake for the event that is due first in host time. Choosing by guest cycle can oversleep: alarms are scheduled
++        // at (EE cycle + d, now + d), and the EE cycle can run ahead of wall time, so an alarm can come before the next
++        // vblank in cycles but after it on the clock. PS2X_IDLE_WAKE_BY_CYCLE=1 restores the cycle order.
++        static const bool byCycle = std::getenv("PS2X_IDLE_WAKE_BY_CYCLE") && std::getenv("PS2X_IDLE_WAKE_BY_CYCLE")[0] == '1';
+         const auto next = std::min_element(m_deadlines.begin(), m_deadlines.end(),
+                                            [](const ScheduledEvent &left, const ScheduledEvent &right)
+                                            {
+-                                               if (left.deadlineCycle != right.deadlineCycle)
++                                               if (byCycle)
++                                               {
++                                                   if (left.deadlineCycle != right.deadlineCycle)
++                                                       return left.deadlineCycle < right.deadlineCycle;
++                                               }
++                                               else if (left.hostDeadline != right.hostDeadline)
+                                                {
+-                                                   return left.deadlineCycle < right.deadlineCycle;
++                                                   return left.hostDeadline < right.hostDeadline;
+                                                }
+                                                return left.sequence < right.sequence;
+                                            });
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 index 9a281e7..5b41ac7 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
@@ -1032,10 +1224,18 @@ index 07c670b..9b909ce 100644
  {
      g_arenaHeapBase = heapBase;
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-index 22a2af6..ac0f737 100644
+index 22a2af6..d0fb408 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 +++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-@@ -974,7 +974,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -1,6 +1,7 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_dma_stats.h"
++#include "runtime/ps2_host_vu.h"
+ #include "ps2_vif1_worker.h"
+ #include <chrono>
+ #include <cstdio>
+@@ -974,7 +975,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
              const bool wasMasked = m_path3Masked;
              m_path3Masked = (imm & 0x8000u) != 0u;
              if (wasMasked && !m_path3Masked)
@@ -1044,3 +1244,15 @@ index 22a2af6..ac0f737 100644
              continue;
          }
          else if (opcode == VIF_MARK)
+@@ -1074,7 +1075,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     if (!same || !mpgSkipSameEnabled())
+                     {
+                         std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+-                        markVU1CodeModified();
++                        if (const auto written = ps2HostVu1().codeWritten)
++                            written(destAddr, copyBytes);
++                        else
++                            markVU1CodeModified();
+                     }
+                     if (ps2Vif1StatsEnabled())
+                         ps2Vif1StatMpg(same);

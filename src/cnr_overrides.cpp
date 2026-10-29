@@ -8,7 +8,12 @@
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <iterator>
 #include <iostream>
 
 namespace
@@ -41,6 +46,33 @@ namespace
         {"isceSifSendCmd", 0x0042F6B8u, 0x0042F6B8u, &returning<ps2_stubs::sceSifSendCmd>},
     };
 
+    // CNR_FRAME_STATS=1: wraps sceGsSyncV (the game's once-per-frame vblank wait) and prints, every 5 s, game frames
+    // per second and how many vblanks each frame took (a histogram), to see whether the game keeps its frame rate.
+    PS2Runtime::RecompiledFunction g_syncVOrig = nullptr;
+
+    void syncVStats(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint64_t lastTick = 0, frames = 0, hist[5] = {};
+        static auto last = std::chrono::steady_clock::now();
+        const uint64_t tick = runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed);
+        if (lastTick != 0)
+            ++hist[std::min<uint64_t>(tick - lastTick, 4)];
+        lastTick = tick;
+        ++frames;
+        const auto now = std::chrono::steady_clock::now();
+        if (const double secs = std::chrono::duration<double>(now - last).count(); secs >= 5.0)
+        {
+            std::fprintf(stderr, "[frames] %.1f game frames/s; vblanks per frame: 0:%llu 1:%llu 2:%llu 3:%llu 4+:%llu\n",
+                         frames / secs, static_cast<unsigned long long>(hist[0]), static_cast<unsigned long long>(hist[1]),
+                         static_cast<unsigned long long>(hist[2]), static_cast<unsigned long long>(hist[3]),
+                         static_cast<unsigned long long>(hist[4]));
+            frames = 0;
+            std::fill(std::begin(hist), std::end(hist), 0ull);
+            last = now;
+        }
+        g_syncVOrig(rdram, ctx, runtime);
+    }
+
     void apply(PS2Runtime &runtime, bool eu)
     {
         for (const Binding &b : kBindings)
@@ -52,6 +84,13 @@ namespace
                 continue;
             }
             runtime.replaceFunction(addr, b.fn);
+        }
+        if (const char *v = std::getenv("CNR_FRAME_STATS"); v && v[0] == '1')
+        {
+            const uint32_t syncV = eu ? 0x003B9DE0u : 0x003B9DF8u; // sceGsSyncV (DB-bound)
+            g_syncVOrig = runtime.lookupFunction(syncV);
+            if (g_syncVOrig)
+                runtime.replaceFunction(syncV, &syncVStats);
         }
     }
 

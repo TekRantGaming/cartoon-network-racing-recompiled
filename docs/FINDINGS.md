@@ -6,15 +6,15 @@ Reverse-engineering notes and the evidence behind each runtime change. Addresses
 
 **Playable (USA).** Cold boot → intro movies → memory card check → title → profile/name entry → Select Show → Driver
 Select → races (tested several minutes: AI opponents, positions, laps, pickups, HUD). Rendering through PCSX2's hardware
-GS (D3D11, 3x), audio through PCSX2's SPU2 (WASAPI), pad via SDL3 (XInput controller detected). Race speed measured at
-~95% of real time (in-game timer vs wall clock).
+GS (D3D11, 3x), audio through PCSX2's SPU2 (WASAPI), pad via SDL3 (XInput controller detected). Races run at full
+speed: 60 game frames/s, one vblank per frame (see "Frame pacing").
 
 **Playable (EU)** as well: `build/cnr_eu/cnr.exe --eu` runs SLES_543.06 as PAL (640x512, 50 Hz vblank, PAL CRTC
-fallbacks), through the menus into races (~93% of real time). The SDK library code sits at the same addresses in both
+fallbacks), through the menus into races at 50 game frames/s. The SDK library code sits at the same addresses in both
 builds, so both overrides apply unchanged; everything else is a separate recompile (`config/eu/`).
 
 Not done / not verified: memory card save/load round trip; audio has been measured (levels per scene) but
-not listened to; full-speed performance.
+not listened to.
 
 ## IOP side (IOPMAIN.IRX, the game's own module)
 
@@ -98,3 +98,17 @@ not listened to; full-speed performance.
 
 All runtime/recompiler changes are in `patches/ps2recomp/0001-cnr-runtime.patch` (apply on drakolordx7/PS2Recomp
 `killzone` @ d042263).
+
+## Frame pacing
+
+`CNR_FRAME_STATS=1` wraps `sceGsSyncV` (USA 0x3B9DF8, EU 0x3B9DE0) and prints game frames/s and vblanks per frame.
+Races first measured 36-46 frames/s: vblanks 15.3 ms apart with periodic 30 ms gaps, the EE idle in between. The
+scheduler's idle wait (`EeScheduler::waitForEvent`) overslept by a whole 15.6 ms Windows timer tick although
+`timeBeginPeriod(1)` was set: Windows 11 ignores timer-resolution requests from a process whose window is not visible
+(the hidden `CNR_HEADLESS` window here; equally a minimised or covered game window). `cnr_main.cpp` opts out with
+`SetProcessInformation(ProcessPowerThrottling, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION)`. After that: USA
+60.0 frames/s (300/300 frames take one vblank), EU 50.0.
+
+Two scheduler safeguards from the investigation stay in (no measurable effect once the timer was fixed): the idle wait
+wakes for the earliest event by host time (`PS2X_IDLE_WAKE_BY_CYCLE=1` reverts), and a vblank's cycle deadline is
+clamped to the cycle the wall-clock floor reaches at its host deadline (`PS2X_VBLANK_CYCLE_CLAMP=0` reverts).

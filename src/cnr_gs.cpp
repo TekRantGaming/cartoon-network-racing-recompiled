@@ -287,6 +287,24 @@ namespace
             }
         }
         s.frames.fetch_add(1, std::memory_order_relaxed);
+        // CNR_GS_STATS=1: every 5 s, guest vblanks and game frames (vblanks with new GIF packets) per second.
+        static const bool stats = std::getenv("CNR_GS_STATS") && std::getenv("CNR_GS_STATS")[0] == '1';
+        if (stats)
+        {
+            static uint64_t flips = 0, vblanks = 0;
+            static auto last = std::chrono::steady_clock::now();
+            if (newPackets) // the game drew something since the previous vblank
+                ++flips;
+            ++vblanks;
+            const auto now = std::chrono::steady_clock::now();
+            const double secs = std::chrono::duration<double>(now - last).count();
+            if (secs >= 5.0)
+            {
+                std::fprintf(stderr, "[gsstats] vblank %.1f/s, game frames %.1f/s\n", vblanks / secs, flips / secs);
+                flips = vblanks = 0;
+                last = now;
+            }
+        }
         if (!s.shotDir.empty())
         {
             const auto now = std::chrono::steady_clock::now();

@@ -45,6 +45,13 @@ namespace
             *vpuStat = (*vpuStat & ~0x0600u) | (kzvuVpuStat() & 0x0600u);
     }
 
+    // MPG wrote this range of VU1 code memory (VIF1 worker thread, before any MSCAL that uses it): only the programs
+    // overlapping it need recompiling.
+    void onCodeWritten(uint32_t addr, uint32_t bytes)
+    {
+        kzvuMicroWritten(addr, bytes);
+    }
+
     void onMscal(uint32_t startPc, uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t gen, uint32_t *vpuStat)
     {
         prepare(top, itop, fbrst, gen);
@@ -119,6 +126,8 @@ bool cnrVuInstall(std::string *error)
         hooks.dataMem = kzvuDataMem();
         hooks.mscal = &onMscal;
         hooks.mscnt = &onMscnt;
+        if (!(std::getenv("CNR_VU_FULL_INVALIDATE") && std::getenv("CNR_VU_FULL_INVALIDATE")[0] == '1'))
+            hooks.codeWritten = &onCodeWritten;
         // VU1 runs on the runtime's VIF1 worker thread; kzvu keeps the two VUs' VPU_STAT/FBRST apart per thread.
         hooks.bindWorkerThread = &kzvuBindVu1Thread;
         ps2SetHostVu1(hooks);
