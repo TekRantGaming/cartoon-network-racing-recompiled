@@ -47,11 +47,44 @@ namespace
         {"isceSifSendCmd", 0x0042F6B8u, 0x0042F6B8u, &returning<ps2_stubs::sceSifSendCmd>},
     };
 
-    // CNR_FRAME_STATS=1: wraps sceGsSyncV (the game's once-per-frame vblank wait) and prints, every 5 s, game frames
-    // per second and how many vblanks each frame took (a histogram), to see whether the game keeps its frame rate.
+    // sceGsSyncV (DB-bound; USA 0x3B9DF8, EU 0x3B9DE0) is the game's vblank wait, called by its frame limiter
+    // (FUN_0032e3e0, EU 0x32E340) once per game frame. Wrapped for the frame rate override and frame statistics.
     PS2Runtime::RecompiledFunction g_syncVOrig = nullptr;
+    bool g_frameStats = false;
 
-    void syncVStats(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // Frame rate (CNR_FPS=<hz>, cnr_main.cpp sets the vblank rate). The limiter measures a frame in vblanks (counter
+    // 0x4C40D8) and turns it into seconds with a seconds-per-vblank float; the video mode setup FUN_0033c810 (EU 0x33C770)
+    // stores the refresh rate (50, 59.94 or 60) and 1/rate in four globals. With the vblank rate raised they are set to
+    // the new rate, so a game frame still advances the game by the real time it took. The mode setup can run again
+    // (display mode changes), so they are re-applied every frame.
+    // EXPERIMENTAL: the game simulates in fixed steps of seconds-per-vblank (at least one per frame, FUN_003831f8), and
+    // its physics world takes that step at race load. At 90/100/120 Hz menus, loading and the race fly-by run at the right
+    // speed, but the race then waits on the grid forever (no countdown). Without this override the race runs, too fast.
+    // docs/FINDINGS.md "Frame rates above 60".
+    struct RateAddrs
+    {
+        uint32_t hz, secondsPerVblank, hzCopy, secondsPerVblankCopy;
+    };
+    constexpr RateAddrs kRateUsa{0x0059C220u, 0x0059B974u, 0x0059C214u, 0x0059BAD8u};
+    constexpr RateAddrs kRateEu{0x0059C2A0u, 0x0059B9F4u, 0x0059C294u, 0x0059BB58u};
+    RateAddrs g_rateAddrs{};
+    float g_targetHz = 0.0f;
+
+    void writeFloat(uint8_t *rdram, uint32_t addr, float value)
+    {
+        std::memcpy(rdram + addr, &value, sizeof(value));
+    }
+
+    void applyFrameRate(uint8_t *rdram)
+    {
+        writeFloat(rdram, g_rateAddrs.hz, g_targetHz);
+        writeFloat(rdram, g_rateAddrs.hzCopy, g_targetHz);
+        writeFloat(rdram, g_rateAddrs.secondsPerVblank, 1.0f / g_targetHz);
+        writeFloat(rdram, g_rateAddrs.secondsPerVblankCopy, 1.0f / g_targetHz);
+    }
+
+    // CNR_FRAME_STATS=1: every 5 s, game frames per second and how many vblanks each frame took (a histogram).
+    void frameStats(PS2Runtime *runtime)
     {
         static uint64_t lastTick = 0, frames = 0, hist[5] = {};
         static auto last = std::chrono::steady_clock::now();
@@ -71,6 +104,14 @@ namespace
             std::fill(std::begin(hist), std::end(hist), 0ull);
             last = now;
         }
+    }
+
+    void syncVHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_targetHz > 0.0f)
+            applyFrameRate(rdram);
+        if (g_frameStats)
+            frameStats(runtime);
         g_syncVOrig(rdram, ctx, runtime);
     }
 
@@ -108,12 +149,18 @@ namespace
             }
             runtime.replaceFunction(addr, b.fn);
         }
-        if (const char *v = std::getenv("CNR_FRAME_STATS"); v && v[0] == '1')
+        g_frameStats = std::getenv("CNR_FRAME_STATS") && std::getenv("CNR_FRAME_STATS")[0] == '1';
+        if (const char *fps = std::getenv("CNR_FPS"); fps && std::atoi(fps) > 0)
         {
-            const uint32_t syncV = eu ? 0x003B9DE0u : 0x003B9DF8u; // sceGsSyncV (DB-bound)
+            g_targetHz = static_cast<float>(std::atoi(fps));
+            g_rateAddrs = eu ? kRateEu : kRateUsa;
+        }
+        if (g_frameStats || g_targetHz > 0.0f)
+        {
+            const uint32_t syncV = eu ? 0x003B9DE0u : 0x003B9DF8u;
             g_syncVOrig = runtime.lookupFunction(syncV);
             if (g_syncVOrig)
-                runtime.replaceFunction(syncV, &syncVStats);
+                runtime.replaceFunction(syncV, &syncVHook);
         }
     }
 

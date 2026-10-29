@@ -134,6 +134,12 @@ int main(int argc, char *argv[])
             ps2SetVblankPeriodMicros(20000u);
             std::cout << "[cnr] PAL disc (EU): 50 Hz" << std::endl;
         }
+        // CNR_FPS=<hz>: guest vblank rate (frame rate) other than the disc's 60/50 Hz.
+        if (const char *fps = std::getenv("CNR_FPS"); fps && std::atoi(fps) > 0)
+        {
+            ps2SetVblankPeriodMicros(static_cast<uint32_t>(1000000 / std::atoi(fps)));
+            std::cout << "[cnr] vblank rate " << std::atoi(fps) << " Hz" << std::endl;
+        }
 
         PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
         if (!opts.iso.empty() && std::filesystem::exists(opts.iso))

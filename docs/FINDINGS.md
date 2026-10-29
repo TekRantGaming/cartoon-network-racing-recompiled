@@ -136,3 +136,34 @@ instead:
   their target, like any HUD element of their quarter.
 * `CNR_GS_DUMP=<seconds>` writes one frame's GIF packets to `build/runs/gsdump.bin`; `scripts/gsdump.py` lists the
   draws (path, primitive, texture, vertex count, screen box).
+
+## Intermittent hang on a file open (fixed)
+
+About one run in ten (more often at higher vblank rates) the game froze on a loading or menu transition: the EE main
+thread waited forever in FUN_00232420 (`WaitSema` at 0x2324A4) for IOPMAIN's acknowledgement of an EE->IOP file
+request (code 0x2C), with every IOP thread idle. IOP->EE completions (code 0x0A, handled by FUN_00231d70, which only
+signals when the reply names the pending request at 0x4C1508) carry their data as SIF "extra" data in a ring of 256-byte
+buffers in EE memory (0x5ED270...). The IOP emulator wrote that data into EE memory as soon as the IOP sent it, while
+the packet itself waits for the EE thread (threaded IOP) and the EE handler runs later still, as a queued invocation.
+IOPMAIN sends ~80 debug-text commands (0x0E) a second (the sound errors below), so the ring wrapped and overwrote a
+pending acknowledgement before its handler ran. Now the extra data travels with the command
+(`IopHost::sendSifCommandWithExtra`) and is written by the invocation's new `onStart` hook, right before its handler
+runs. 10 of 10 runs at 120 Hz without a hang (before: hangs within two). `PS2X_SIF_LOG=1` logs every user SIF command
+in both directions.
+
+## Frame rates above 60 (experimental, CNR_FPS)
+
+`CNR_FPS=<hz>` raises the guest vblank rate. The frame limiter FUN_0032e3e0 measures each frame in vblanks (counter
+0x4C40D8) and multiplies by seconds-per-vblank (0x59B974, set with 1/refresh by the video mode setup FUN_0033c810, which
+also stores the refresh rate at 0x59C220/0x59C214 and the frame time at 0x59BAD8). The main loop (around 0x10D250) then
+runs fixed simulation steps: FUN_003831f8 accumulates the frame time and returns floor(acc / step), at least 1 and at
+most 2; each step is seconds-per-vblank long (also as whole milliseconds at 0x4C566C, FUN_003831c0), and the physics
+world takes that step at race load (0x177ED4).
+
+* Without changes, a higher vblank rate runs the game faster (one 1/60 step per frame): 90 Hz measured 1.45x.
+* With the rate globals set to the new rate (what `CNR_FPS` does, re-applied every frame from the `sceGsSyncV` hook),
+  menus, loading and the race fly-by keep real-time speed at 90/100/120 Hz (frames: 88/100/117 per second), but in the
+  race the karts then wait on the grid forever: the countdown never starts. Not resolved; candidates are the physics
+  world's settle/start logic at a smaller step. Until then 60 Hz (EU 50) is the supported rate.
+* The runtime's automatic EE cycle scale (60 / vblank rate) is needed: with `PS2X_EE_CYCLE_SCALE=1` frames span
+  several vblanks at 90 Hz.

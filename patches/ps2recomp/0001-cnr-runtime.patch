@@ -1,3 +1,29 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index 1eceb08..40fd4a4 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -130,6 +130,21 @@ namespace ps2x::iop
+             return false;
+         }
+ 
++        // The same with the command's extra data (SIF DMA'd to EE memory at extraDestination before the packet). A host
++        // that runs the EE handler later than the send must write the data right before that handler runs: a second
++        // command to the same destination would otherwise overwrite it first. Default: write now, then send.
++        virtual bool sendSifCommandWithExtra(uint32_t commandId,
++                                             const void *packet,
++                                             size_t packetSize,
++                                             uint32_t extraDestination,
++                                             const void *extra,
++                                             size_t extraSize)
++        {
++            if (extraSize != 0u && !writeGuest(extraDestination, extra, extraSize))
++                return false;
++            return sendSifCommand(commandId, packet, packetSize);
++        }
++
+         virtual void log(LogLevel level, std::string_view message) = 0;
+     };
+ }
 diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
 index 939901f..4915604 100644
 --- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
@@ -229,7 +255,7 @@ index 3f13267..33a64cd 100644
          [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
          [[nodiscard]] bool freeMemory(uint32_t address);
 diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
-index effa282..c812ad1 100644
+index effa282..0a4443d 100644
 --- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
 +++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
 @@ -12,6 +12,7 @@
@@ -370,8 +396,27 @@ index effa282..c812ad1 100644
          case 14: // InitRpc
          case 15:
          case 16:
-@@ -203,10 +307,19 @@ namespace ps2x::iop::detail
-             const bool delivered = m_host.sendSifCommand(commandId, packet.data(), packetSize);
+@@ -186,9 +290,7 @@ namespace ps2x::iop::detail
+             if (signedExtraSize > 0)
+             {
+                 extraSize = static_cast<uint32_t>(signedExtraSize);
+-                if (extraSource == 0u || extraDestination == 0u ||
+-                    !m_memory.ownsRamRange(extraSource, extraSize) ||
+-                    !m_host.writeGuest(extraDestination, m_memory.ram().data() + IopMemory::physicalAddress(extraSource), extraSize))
++                if (extraSource == 0u || extraDestination == 0u || !m_memory.ownsRamRange(extraSource, extraSize))
+                 {
+                     setV0(0u);
+                     return true;
+@@ -200,13 +302,26 @@ namespace ps2x::iop::detail
+             std::memcpy(packet.data() + 4u, &extraDestination, sizeof(extraDestination));
+             std::memcpy(packet.data() + 8u, &commandId, sizeof(commandId));
+ 
+-            const bool delivered = m_host.sendSifCommand(commandId, packet.data(), packetSize);
++            // The extra data reaches EE memory together with the packet (Cartoon Network Racing: two replies to its
++            // one reply buffer, the first overwritten before its handler ran, left the EE waiting forever for a file open).
++            const uint8_t *const extraData = extraSize != 0u ? m_memory.ram().data() + IopMemory::physicalAddress(extraSource) : nullptr;
++            const bool delivered = m_host.sendSifCommandWithExtra(commandId, packet.data(), packetSize, extraDestination,
++                                                                  extraData, extraSize);
              if (iopSyncTraceLevel() >= 2)
              {
 -                uint32_t words[4] = {};
@@ -538,6 +583,18 @@ index 80f65d7..9615201 100644
  
  // Additional VU0 operations
  #define PS2_VSQRT(x) sqrtf(x)
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index ede4cb5..be541c1 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -100,6 +100,7 @@ struct GuestInvocation
+     uint64_t tag = 0;
+     R5900Context context{};
+     std::function<void(const R5900Context &, R5900Context &)> onComplete;
++    std::function<void()> onStart; // EE thread, right before the invocation's code first runs
+ };
+ 
+ struct GuestThread
 diff --git a/ps2xRuntime/include/runtime/ps2_host_arena.h b/ps2xRuntime/include/runtime/ps2_host_arena.h
 index 9c0614f..bb90f27 100644
 --- a/ps2xRuntime/include/runtime/ps2_host_arena.h
@@ -589,7 +646,7 @@ index 4afdcbe..a0578d4 100644
      struct PendingTransfer
      {
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index 72017a4..8bae9db 100644
+index 72017a4..83b3916 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -1,3 +1,4 @@
@@ -597,7 +654,25 @@ index 72017a4..8bae9db 100644
  #include "runtime/ps2_host_gs.h"
  #include "runtime/ps2_timeline.h"
  #include <atomic>
-@@ -778,6 +779,20 @@ namespace
+@@ -455,6 +456,8 @@ void EeScheduler::run()
+                     SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+                 }
+                 ps2tl::rec(ps2tl::INV_B, invocation.context.pc, static_cast<uint32_t>(invocation.kind), static_cast<uint32_t>(m_eeCycle));
++                if (invocation.onStart)
++                    invocation.onStart();
+                 owner->invocations.push_back(std::move(invocation));
+             }
+         }
+@@ -536,6 +539,8 @@ void EeScheduler::run()
+                 SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+             }
+             ps2tl::rec(ps2tl::INV_B, invocation.context.pc, static_cast<uint32_t>(invocation.kind), static_cast<uint32_t>(m_eeCycle));
++            if (invocation.onStart)
++                invocation.onStart();
+             running->invocations.push_back(std::move(invocation));
+             schedTrace('I', running->id, running->invocations.size(), context);
+             continue;
+@@ -778,6 +783,20 @@ namespace
          const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
          return static_cast<uint64_t>(static_cast<double>(ns) * 0.294912);
      }
@@ -618,7 +693,7 @@ index 72017a4..8bae9db 100644
  }
  
  void EeScheduler::accountCycles(uint32_t cycles) noexcept
-@@ -793,6 +808,10 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+@@ -793,6 +812,10 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
      {
          wallCycles = static_cast<uint64_t>(hostCop0Count64());
          wallSampleCountdown = 63u;
@@ -629,7 +704,7 @@ index 72017a4..8bae9db 100644
      }
      uint64_t next = m_eeCycle + std::max<uint64_t>(1u, cycles);
  #ifdef PS2X_SCHED_STATS_HOT
-@@ -2320,12 +2339,19 @@ void EeScheduler::processDueDeadlines()
+@@ -2320,12 +2343,19 @@ void EeScheduler::processDueDeadlines()
          {
              if (scheduled.event.type == EeEventType::VBlankStart)
              {
@@ -652,7 +727,7 @@ index 72017a4..8bae9db 100644
              }
              processEvent(scheduled.event);
          }
-@@ -2506,12 +2532,21 @@ void EeScheduler::waitForEvent()
+@@ -2506,12 +2536,21 @@ void EeScheduler::waitForEvent()
      auto hostDeadline = std::chrono::steady_clock::time_point::max();
      if (!m_deadlines.empty())
      {
@@ -913,12 +988,65 @@ index 9a281e7..5b41ac7 100644
      }
  
      void sceMpegGetPictureRAW8xy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 564d873..8111ff0 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -1,6 +1,16 @@
+ #include "Common.h"
+ #include "MemoryCard.h"
+ 
++namespace
++{
++    // Games poll GetInfo/Sync every frame on both ports; PS2X_MC_LOG=1 logs those too.
++    bool mcPollLog()
++    {
++        static const bool on = std::getenv("PS2X_MC_LOG") && std::getenv("PS2X_MC_LOG")[0] == '1';
++        return on;
++    }
++}
++
+ namespace ps2_stubs
+ {
+     namespace
+@@ -905,7 +915,8 @@ namespace ps2_stubs
+             }
+         }
+ 
+-        RUNTIME_LOG("[MC] GetInfo port=" << port << " type=" << cardType
++        if (mcPollLog())
++            RUNTIME_LOG("[MC] GetInfo port=" << port << " type=" << cardType
+                                          << " free=" << freeBlocks << " format=" << format
+                                          << " result=" << result);
+         setReturnS32(ctx, 0);
+@@ -1213,7 +1224,8 @@ namespace ps2_stubs
+             return;
+         }
+ 
+-        RUNTIME_LOG("[MC] Sync cmd=" << cmd << " result=" << result);
++        if (mcPollLog())
++            RUNTIME_LOG("[MC] Sync cmd=" << cmd << " result=" << result);
+ 
+         if (cmdPtr != 0u)
+         {
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
-index dc975ed..c21cd2b 100644
+index dc975ed..2e5be07 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
-@@ -24,9 +24,11 @@ namespace ps2_stubs
+@@ -22,11 +22,23 @@ namespace ps2_stubs
+         ps2_syscalls::SifLoadModule(rdram, ctx, runtime);
+     }
  
++    namespace
++    {
++        // PS2X_SIF_LOG=1: every user SIF command between EE and IOP (header word 3, first payload words, extra data).
++        bool sifLogOn()
++        {
++            static const bool on = std::getenv("PS2X_SIF_LOG") && std::getenv("PS2X_SIF_LOG")[0] == '1';
++            return on;
++        }
++    }
++
      void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
      {
 +        // sceSifSendCmd(cid, packet, psize, src, dest, size): the EE ABI (EABI64) passes arguments 5-8 in $t0-$t3,
@@ -931,7 +1059,7 @@ index dc975ed..c21cd2b 100644
          if (size != 0u && srcAddr != 0u && dstAddr != 0u)
          {
              std::vector<uint8_t> payload(size);
-@@ -48,6 +50,38 @@ namespace ps2_stubs
+@@ -48,6 +60,47 @@ namespace ps2_stubs
              }
          }
  
@@ -958,6 +1086,15 @@ index dc975ed..c21cd2b 100644
 +                std::memcpy(packet + 0, &sizeWord, 4);
 +                std::memcpy(packet + 4, &dstAddr, 4);
 +                std::memcpy(packet + 8, &cid, 4);
++                if (sifLogOn())
++                {
++                    uint32_t w[4] = {}, e[3] = {};
++                    std::memcpy(w, packet + 12u, std::min<uint32_t>(16u, packetSize - 12u));
++                    if (size >= 12u)
++                        (void)runtime->readIopMemory(dstAddr, e, sizeof(e));
++                    std::fprintf(stderr, "[sif] EE->IOP cid=0x%x code=%08x %08x %08x %08x extra=%u@%08x: %08x %08x %08x\n", cid,
++                                 w[0], w[1], w[2], w[3], size, dstAddr, e[0], e[1], e[2]);
++                }
 +                if (!runtime->sendIopSifCommand(packet, packetSize))
 +                {
 +                    static int unhandled = 0;
@@ -970,10 +1107,58 @@ index dc975ed..c21cd2b 100644
          setReturnS32(ctx, 1);
      }
  
-@@ -235,6 +269,19 @@ namespace ps2_stubs
+@@ -226,14 +279,65 @@ namespace ps2_stubs
+         seedDefaultSifRegsLocked();
+     }
+ 
++    namespace
++    {
++        void writeSifExtra(uint8_t *rdram, uint32_t destination, const uint8_t *data, size_t size)
++        {
++            for (size_t i = 0; i < size; ++i)
++                if (uint8_t *dst = getMemPtr(rdram, destination + static_cast<uint32_t>(i)))
++                    *dst = data[i];
++        }
++
++    }
++
+     bool dispatchSifCommand(uint8_t *rdram,
+                             PS2Runtime *runtime,
+                             uint32_t commandId,
+                             const void *packet,
+-                            size_t packetSize) noexcept
++                            size_t packetSize,
++                            uint32_t extraDestination,
++                            const uint8_t *extra,
++                            size_t extraSize) noexcept
+     {
          if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
              return false;
- 
++        // Delivered without a handler (or failing below): the data still arrived, like the DMA it is.
++        struct ExtraNow
++        {
++            uint8_t *rdram;
++            uint32_t destination;
++            const uint8_t *data;
++            size_t size;
++            bool pending = true;
++            ~ExtraNow()
++            {
++                if (pending && data && size)
++                    writeSifExtra(rdram, destination, data, size);
++            }
++        } extraNow{rdram, extraDestination, extra, extraSize};
++        if (sifLogOn())
++        {
++            uint32_t w[4] = {};
++            std::memcpy(w, static_cast<const uint8_t *>(packet) + 12u, std::min<size_t>(16u, packetSize - 12u));
++            uint32_t e[3] = {};
++            if (extra)
++                std::memcpy(e, extra, std::min<size_t>(sizeof(e), extraSize));
++            std::fprintf(stderr, "[sif] IOP->EE cid=0x%x code=%08x %08x %08x %08x extra=%zu@%08x: %08x %08x %08x\n", commandId,
++                         w[0], w[1], w[2], w[3], extraSize, extraDestination, e[0], e[1], e[2]);
++        }
++
 +        // System command SIF_CMD_SET_SREG (cid 0x80000001, packet: header, u32 index, u32 value). libsif's own system
 +        // handler is not running (sceSifInitCmd is HLE), so the runtime keeps the software registers that the
 +        // sceSifGetSreg handler reads. Cartoon Network Racing's IOPMAIN.IRX reports "IOP ready" in sreg 31 this way.
@@ -986,10 +1171,42 @@ index dc975ed..c21cd2b 100644
 +            g_sifSregs[index] = value;
 +            return true;
 +        }
-+
+ 
          SifCmdHandler registered{};
          {
-             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+@@ -279,7 +383,16 @@ namespace ps2_stubs
+             {
+                 runtime->guestFree(packetAddress);
+             };
++            if (extra && extraSize)
++            {
++                std::vector<uint8_t> data(extra, extra + extraSize);
++                invocation.onStart = [rdram, extraDestination, data = std::move(data)]()
++                {
++                    writeSifExtra(rdram, extraDestination, data.data(), data.size());
++                };
++            }
+             runtime->eeScheduler().queueInvocation(std::move(invocation));
++            extraNow.pending = false;
+             return true;
+         }
+         catch (...)
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
+index 8673e80..61ee9e0 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
+@@ -4,7 +4,10 @@
+ 
+ namespace ps2_stubs
+ {
+-    bool dispatchSifCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t commandId, const void *packet, size_t packetSize) noexcept;
++    // extra: the command's extra data, written to EE memory at extraDestination when the handler starts (or at once
++    // when no handler takes the command, like the completed DMA it is).
++    bool dispatchSifCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t commandId, const void *packet, size_t packetSize,
++                            uint32_t extraDestination = 0u, const uint8_t *extra = nullptr, size_t extraSize = 0u) noexcept;
+     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
 index 3dc8e0d..cef946c 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
@@ -1097,6 +1314,84 @@ index 9614016..1506659 100644
  
          setReturnU32(ctx, ret);
      }
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 8132049..104f158 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -573,6 +573,17 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+                                        const void *packet,
+                                        size_t packetSize)
+ {
++    return sendSifCommandWithExtra(commandId, packet, packetSize, 0u, nullptr, 0u);
++}
++
++bool PS2IopHostAdapter::sendSifCommandWithExtra(uint32_t commandId,
++                                                const void *packet,
++                                                size_t packetSize,
++                                                uint32_t extraDestination,
++                                                const void *extra,
++                                                size_t extraSize)
++{
++    const uint8_t *const extraBytes = static_cast<const uint8_t *>(extra);
+     if (m_postSifCommands.load(std::memory_order_acquire))
+     {
+         // Threaded IOP: queue the packet (in order) for the EE thread; dispatchSifCommand allocates guest memory and
+@@ -586,6 +597,9 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+             PostedSifCommand posted;
+             posted.commandId = commandId;
+             posted.packet.assign(static_cast<const uint8_t *>(packet), static_cast<const uint8_t *>(packet) + packetSize);
++            posted.extraDestination = extraDestination;
++            if (extraBytes && extraSize != 0u)
++                posted.extra.assign(extraBytes, extraBytes + extraSize);
+             m_posted.push_back(std::move(posted));
+             if (!m_postWakeQueued)
+             {
+@@ -605,7 +619,10 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+                                          &m_runtime,
+                                          commandId,
+                                          packet,
+-                                         packetSize);
++                                         packetSize,
++                                         extraDestination,
++                                         extraBytes,
++                                         extraBytes ? extraSize : 0u);
+ }
+ 
+ void PS2IopHostAdapter::drainPosted()
+@@ -651,7 +668,10 @@ void PS2IopHostAdapter::drainPosted()
+                                             &m_runtime,
+                                             command.commandId,
+                                             command.packet.data(),
+-                                            command.packet.size());
++                                            command.packet.size(),
++                                            command.extraDestination,
++                                            command.extra.data(),
++                                            command.extra.size());
+     }
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 7fb13dd..0fe0a64 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -86,6 +86,8 @@ public:
+                              uint32_t a3,
+                              uint32_t *resultAddress) override;
+     bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
++    bool sendSifCommandWithExtra(uint32_t commandId, const void *packet, size_t packetSize, uint32_t extraDestination,
++                                 const void *extra, size_t extraSize) override;
+ 
+     void log(ps2x::iop::LogLevel level, std::string_view message) override;
+ 
+@@ -106,6 +108,8 @@ private:
+     {
+         uint32_t commandId = 0;
+         std::vector<uint8_t> packet;
++        uint32_t extraDestination = 0;
++        std::vector<uint8_t> extra; // written to EE memory when the command's EE handler starts
+         std::function<void()> work; // set: run this instead of dispatching a SIF command
+     };
+ 
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
 index facaf8c..dbd63ed 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
