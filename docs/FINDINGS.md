@@ -167,3 +167,11 @@ world takes that step at race load (0x177ED4).
   world's settle/start logic at a smaller step. Until then 60 Hz (EU 50) is the supported rate.
 * The runtime's automatic EE cycle scale (60 / vblank rate) is needed: with `PS2X_EE_CYCLE_SCALE=1` frames span
   several vblanks at 90 Hz.
+
+## Memory card saves
+
+The runtime's memory card emulation stores each card as a host folder (mc0 = slot 1, mc1 = slot 2). `cnr_main.cpp` puts
+them next to the game: `<folder of cnr.exe>/saves/USA/mc0|mc1` and `saves/EU/...` (`CNR_SAVE_DIR=<dir>` overrides the
+`saves` folder). Earlier builds saved into `extracted/<region>/mc0`; those saves are copied over once when the new folder
+does not exist yet. Verified: new profile (name entry, autosave notice, "saving data") writes
+`BASLUS-21438PPLAYER/{BASLUS-21438PPLAYER,icon.sys,iconlst.icn}`, and a later run loads it ("load successful").

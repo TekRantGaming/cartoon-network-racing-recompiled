@@ -13,6 +13,7 @@
 //   CNR_SHOT_DIR=<dir>     save the GS output as PNG every CNR_SHOT_INTERVAL seconds (default 5)
 //   CNR_RENDERER=d3d11|d3d12|vulkan, CNR_UPSCALE=<1..8>
 //   CNR_GS=cpu             the runtime's software GS instead of PCSX2's (PS2X_HEADLESS_SHOTS for frames)
+//   CNR_SAVE_DIR=<dir>     memory cards in <dir>/<USA|EU>/mc0, mc1 (default: saves/ next to cnr.exe)
 //   CNR_WIDESCREEN=0       original 4:3 instead of 16:9 Hor+; CNR_HUD_CENTRE=1: the 16:9 HUD stays in the centre 4:3 area
 //   CNR_GS_DUMP=<s>        write one frame's GIF packets (scripts/gsdump.py); CNR_FRAME_STATS=1: game frames/s
 
@@ -93,6 +94,38 @@ namespace
         cfg.widescreen = !(std::getenv("CNR_WIDESCREEN") && std::getenv("CNR_WIDESCREEN")[0] == '0');
         cfg.hudAtEdges = !envOn("CNR_HUD_CENTRE");
         return cfg;
+    }
+
+    std::filesystem::path exeDirectory()
+    {
+        wchar_t buffer[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+        return n > 0 && n < MAX_PATH ? std::filesystem::path(buffer).parent_path() : std::filesystem::current_path();
+    }
+
+    // Memory cards (slot 1 = mc0, slot 2 = mc1) live next to the game: <exe dir>/saves/<USA|EU>/mc0, or under
+    // CNR_SAVE_DIR. loadELF points them at the ELF's folder, so this runs after it. Saves made there by earlier builds
+    // (extracted/<region>/mc0) are copied over once, while the new folder is still empty.
+    void setupSaves(bool pal)
+    {
+        PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+        const std::filesystem::path oldRoot = paths.mcRoot;
+        const char *custom = std::getenv("CNR_SAVE_DIR");
+        const std::filesystem::path base = custom && *custom ? std::filesystem::path(custom) : exeDirectory() / "saves";
+        const std::filesystem::path root = std::filesystem::absolute(base / (pal ? "EU" : "USA")).lexically_normal();
+        std::error_code ec;
+        const bool fresh = !std::filesystem::exists(root / "mc0", ec);
+        std::filesystem::create_directories(root / "mc0", ec);
+        std::filesystem::create_directories(root / "mc1", ec);
+        if (fresh && !oldRoot.empty() && std::filesystem::is_directory(oldRoot, ec) && oldRoot != root / "mc0")
+        {
+            std::filesystem::copy(oldRoot, root / "mc0", std::filesystem::copy_options::recursive, ec);
+            if (!ec)
+                std::cout << "[cnr] copied existing saves from " << oldRoot.string() << std::endl;
+        }
+        paths.mcRoot = root / "mc0";
+        PS2Runtime::setIoPaths(paths);
+        std::cout << "[cnr] memory cards: " << root.string() << std::endl;
     }
 
     void fail(SDL_Window *window, const std::string &msg)
@@ -219,6 +252,7 @@ int main(int argc, char *argv[])
             fail(window, "failed to load ELF: " + elf.string());
             return 1;
         }
+        setupSaves(pal);
 
         std::atomic<bool> runtimeDone{false};
         std::thread runtimeThread([&]() {
