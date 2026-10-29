@@ -175,3 +175,24 @@ them next to the game: `<folder of cnr.exe>/saves/USA/mc0|mc1` and `saves/EU/...
 `saves` folder). Earlier builds saved into `extracted/<region>/mc0`; those saves are copied over once when the new folder
 does not exist yet. Verified: new profile (name entry, autosave notice, "saving data") writes
 `BASLUS-21438PPLAYER/{BASLUS-21438PPLAYER,icon.sys,iconlst.icn}`, and a later run loads it ("load successful").
+
+## Sound banks loaded with the wrong file's size (fixed)
+
+IOPMAIN printed `SOUND_CheckSPUMemory ... > SPU RAM size`, `StartStream ... SPU Memory Error`, `playing error` on every
+boot. The SIF trace (`PS2X_SIF_LOG=1`) showed each EE answer to the IOP's file lookups (IOP->EE 0x0C with the name,
+EE->IOP 0x2C sub-command 8 with sector and size) was right, but every `StartStream` used the previous lookup's size:
+FrontEndSounds.snd started with musicarc.snd's 11.5 MB (into SPU RAM: the error), materials.snd with FrontEndSounds',
+and so on; the first stream got an uninitialised 653 MB.
+
+IOPMAIN's lookup (0x515AC) creates semaphore 172 (count 0, max 1), sends 0x0C and `WaitSema(172)`s; the IOP handler
+for the answer signals it. The lookup runs inside the sound RPC (sid 0x12345), and the IOP emulator runs RPC server
+functions synchronously, outside any IOP thread, where `WaitSema` (`waitSemaphoreOutsideThread`) runs the IOP's
+threads until the semaphore is signalled, giving up after 1 s of IOP time. Only the EE could signal it, and with all
+IOP threads idle the loop skipped that second of IOP time at once: `WaitSema(172) outside a thread ... TIMED OUT`. The
+semaphore was not taken, the answer arriving ~36 ms later left it at 1, and from then on every lookup's wait returned at
+once, with the previous answer.
+
+Fix (ps2xIOP): while the IOP is idle in that wait, idle steps are kept short (0.5 ms of IOP time) and the IOP worker
+thread releases the IOP lock for 0.2 ms (`IopEmulator::setExternalWait`) so the EE can deliver its answer; queued RPCs
+are not started meanwhile. Gives up after 2 s wall time. Result: no timeouts, no SPU/stream errors; music streams with
+per-track seeks into musicarc.snd; audio output measured in menus and races.

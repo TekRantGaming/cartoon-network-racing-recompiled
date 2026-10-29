@@ -204,10 +204,15 @@ index eed2b61..139f486 100644
          case 10:
              setV0(0xFFFFFFFFu);
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index af75b87..2fd172b 100644
+index af75b87..2945726 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
-@@ -334,6 +334,21 @@ namespace ps2x::iop::detail
+@@ -1,3 +1,4 @@
++#include <chrono>
+ #include <cstdlib>
+ #include "iop_emulator.h"
+ #include "imports/iop_cdvd.h"
+@@ -334,6 +335,21 @@ namespace ps2x::iop::detail
                  cpu.gpr[2] = value;
              };
  
@@ -229,10 +234,47 @@ index af75b87..2fd172b 100644
              if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
                  return ImportDisposition::Handled;
  
-@@ -980,6 +995,12 @@ namespace ps2x::iop::detail
+@@ -688,6 +704,7 @@ namespace ps2x::iop::detail
+         // runCycles is called on nearly every EE checkpoint with a few cycles; while the IOP sleeps this lets those
+         // calls just advance the clock instead of re-scanning every event source. 0 = unknown.
+         uint64_t idleUntil = 0;
++        std::function<bool()> externalWait; // IopEmulator::setExternalWait
+ 
+         void runCycles(uint64_t cycles) noexcept
+         {
+@@ -782,8 +799,22 @@ namespace ps2x::iop::detail
+             kernel.setOutsideSemaphoreWait(id);
+             try
+             {
++                // With every IOP thread idle only the EE can signal (Cartoon Network Racing: a sound RPC asks the EE for
++                // a file's size with SIF command 0x0C and waits on semaphore 172 for the answer). Skipping idle time
++                // reached the limit at once, the wait gave up without taking the semaphore, the late answer left it at
++                // 1, and every later lookup used the previous file's answer (music sizes for sound banks: "SPU RAM
++                // size" errors, no sound effects). So idle steps are kept short and the host waits for the EE.
++                const uint64_t window = kIopClockHz / 2000u;
++                const auto wallStart = std::chrono::steady_clock::now();
+                 while (kernel.semaphoreCount(id) == 0 && totalCycles < limit)
+-                    (void)scheduleStep(limit);
++                {
++                    const uint64_t idle = scheduleStep(externalWait ? std::min(limit, totalCycles + window) : limit);
++                    if (idle != 0u && externalWait && kernel.semaphoreCount(id) == 0)
++                    {
++                        if (std::chrono::steady_clock::now() - wallStart > std::chrono::seconds(2) || !externalWait())
++                            break;
++                    }
++                }
+             }
+             catch (...)
+             {
+@@ -980,6 +1011,17 @@ namespace ps2x::iop::detail
          m_impl->rpc.onSifTransfer(transfer);
      }
  
++    void IopEmulator::setExternalWait(std::function<bool()> wait)
++    {
++        m_impl->externalWait = std::move(wait);
++    }
++
 +    bool IopEmulator::deliverSifCommand(const uint8_t *packet, uint32_t size)
 +    {
 +        m_impl->idleUntil = 0;
@@ -243,10 +285,17 @@ index af75b87..2fd172b 100644
      {
          m_impl->idleUntil = 0;
 diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
-index 3f13267..33a64cd 100644
+index 3f13267..cf4d01a 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.h
 +++ b/ps2xIOP/src/emulator/iop_emulator.h
-@@ -28,6 +28,7 @@ namespace ps2x::iop::detail
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <functional>
+ #include "ps2x/iop/iop_host.h"
+ #include "ps2x/iop/iop_types.h"
+ 
+@@ -28,6 +29,7 @@ namespace ps2x::iop::detail
          [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, const std::vector<uint8_t> *sendPayload = nullptr);
          [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
          void onSifTransfer(const SifTransfer &transfer);
@@ -254,6 +303,17 @@ index 3f13267..33a64cd 100644
  
          [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
          [[nodiscard]] bool freeMemory(uint32_t address);
+@@ -41,6 +43,10 @@ namespace ps2x::iop::detail
+         [[nodiscard]] uint32_t loadedModuleCount() const noexcept;
+         [[nodiscard]] uint32_t threadCount() const noexcept;
+         [[nodiscard]] uint32_t rpcServerCount() const noexcept;
++        // Called (with the IOP otherwise idle) while synchronous IOP code waits for a semaphore that only something
++        // outside the IOP can signal: lets the host release its locks briefly so the EE can deliver commands. Returns
++        // false when it cannot wait (then the wait gives up as before).
++        void setExternalWait(std::function<bool()> wait);
+ 
+     private:
+         class Impl;
 diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
 index effa282..0a4443d 100644
 --- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
@@ -487,10 +547,86 @@ index dbb7e30..bbf70d5 100644
          bool m_sifInitialized = false;
      };
 diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
-index 6a1952e..5539ac1 100644
+index 6a1952e..ae26801 100644
 --- a/ps2xIOP/src/iop_subsystem.cpp
 +++ b/ps2xIOP/src/iop_subsystem.cpp
-@@ -714,6 +714,13 @@ namespace ps2x::iop
+@@ -41,6 +41,7 @@ namespace ps2x::iop
+     namespace
+     {
+         thread_local bool t_onIopThread = false;
++        thread_local int t_execDepth = 0; // execMutex lock depth held by the IOP worker thread
+ 
+         uint64_t nowNs()
+         {
+@@ -197,6 +198,7 @@ namespace ps2x::iop
+             if (threadStarted.load(std::memory_order_acquire) || !threaded.load(std::memory_order_acquire))
+                 return;
+             stopRequested.store(false, std::memory_order_release);
++            emulator.setExternalWait([this]() { return externalWait(); });
+ #if defined(_WIN32)
+             struct Start
+             {
+@@ -256,6 +258,26 @@ namespace ps2x::iop
+ #endif
+         }
+ 
++        struct DepthGuard
++        {
++            DepthGuard() { ++t_execDepth; }
++            ~DepthGuard() { --t_execDepth; }
++        };
++
++        // IopEmulator external wait: on the worker thread, holding execMutex once, release it for a moment so EE-side
++        // callers (SIF commands, register access) get in. Queued RPCs are not run meanwhile (the RPC server is busy).
++        bool externalWait()
++        {
++            if (!t_onIopThread || t_execDepth != 1)
++                return false;
++            externalWaiting.store(true, std::memory_order_release);
++            execMutex.unlock();
++            std::this_thread::sleep_for(std::chrono::microseconds(200));
++            execMutex.lock();
++            externalWaiting.store(false, std::memory_order_release);
++            return true;
++        }
++
+         void threadMain()
+         {
+             t_onIopThread = true;
+@@ -287,6 +309,7 @@ namespace ps2x::iop
+                     if (rpcPending.load(std::memory_order_acquire) != 0u)
+                     {
+                         std::lock_guard<std::recursive_mutex> lock(execMutex);
++                        const DepthGuard depth;
+                         runQueuedRpcs();
+                     }
+                     else
+@@ -304,6 +327,7 @@ namespace ps2x::iop
+                     const uint64_t chunk = std::min<uint64_t>(target - consumedLocal, kChunkEeCycles);
+                     {
+                         std::lock_guard<std::recursive_mutex> lock(execMutex);
++                        const DepthGuard depth;
+                         const uint64_t t0 = nowNs();
+                         emulator.runEeCycles(chunk);
+                         runQueuedRpcs();
+@@ -468,6 +492,8 @@ namespace ps2x::iop
+         // must stay ordered behind the queue). A `done` that throws would lose the completion; it must not.
+         void runQueuedRpcs()
+         {
++            if (externalWaiting.load(std::memory_order_acquire))
++                return; // an RPC on the worker thread is waiting for the EE; queued ones run after it
+             while (rpcPending.load(std::memory_order_acquire) != 0u)
+             {
+                 IopSubsystem::AsyncRpc call;
+@@ -509,6 +535,7 @@ namespace ps2x::iop
+         std::atomic<int> execWaiters{0};
+         std::atomic<bool> threaded{false};
+         std::atomic<bool> threadStarted{false};
++        std::atomic<bool> externalWaiting{false}; // externalWait(): worker thread released execMutex mid-RPC
+         std::atomic<bool> stopRequested{false};
+         std::mutex threadStartMutex;
+         std::atomic<uint64_t> published{0};
+@@ -714,6 +741,13 @@ namespace ps2x::iop
          return true;
      }
  
@@ -1030,20 +1166,57 @@ index 564d873..8111ff0 100644
          if (cmdPtr != 0u)
          {
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
-index dc975ed..2e5be07 100644
+index dc975ed..eaca906 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
-@@ -22,11 +22,23 @@ namespace ps2_stubs
+@@ -1,3 +1,5 @@
++#include <chrono>
++#include <string>
+ #include "Common.h"
+ #include "SIF.h"
+ #include "../Syscalls/RPC.h"
+@@ -22,11 +24,54 @@ namespace ps2_stubs
          ps2_syscalls::SifLoadModule(rdram, ctx, runtime);
      }
  
++    bool sifLogEnabled() noexcept
++    {
++        static const bool on = std::getenv("PS2X_SIF_LOG") && std::getenv("PS2X_SIF_LOG")[0] == '1';
++        return on;
++    }
++
++    unsigned long long sifLogMicros() noexcept
++    {
++        static const auto start = std::chrono::steady_clock::now();
++        return static_cast<unsigned long long>(
++            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
++    }
++
 +    namespace
 +    {
 +        // PS2X_SIF_LOG=1: every user SIF command between EE and IOP (header word 3, first payload words, extra data).
 +        bool sifLogOn()
 +        {
-+            static const bool on = std::getenv("PS2X_SIF_LOG") && std::getenv("PS2X_SIF_LOG")[0] == '1';
-+            return on;
++            return sifLogEnabled();
++        }
++
++        // The first 48 bytes of a command's extra data, as words and as text.
++        std::string describeExtra(const uint8_t *data, size_t size)
++        {
++            std::string out;
++            char word[12];
++            const size_t n = std::min<size_t>(size, 48u);
++            for (size_t i = 0; i + 4 <= n; i += 4)
++            {
++                uint32_t w;
++                std::memcpy(&w, data + i, 4);
++                std::snprintf(word, sizeof(word), " %08x", w);
++                out += word;
++            }
++            out += " |";
++            for (size_t i = 0; i < n; ++i)
++                out += (data[i] >= 0x20 && data[i] < 0x7F) ? static_cast<char>(data[i]) : '.';
++            return out + "|";
 +        }
 +    }
 +
@@ -1059,7 +1232,7 @@ index dc975ed..2e5be07 100644
          if (size != 0u && srcAddr != 0u && dstAddr != 0u)
          {
              std::vector<uint8_t> payload(size);
-@@ -48,6 +60,47 @@ namespace ps2_stubs
+@@ -48,6 +93,49 @@ namespace ps2_stubs
              }
          }
  
@@ -1088,12 +1261,14 @@ index dc975ed..2e5be07 100644
 +                std::memcpy(packet + 8, &cid, 4);
 +                if (sifLogOn())
 +                {
-+                    uint32_t w[4] = {}, e[3] = {};
++                    uint32_t w[4] = {};
 +                    std::memcpy(w, packet + 12u, std::min<uint32_t>(16u, packetSize - 12u));
-+                    if (size >= 12u)
-+                        (void)runtime->readIopMemory(dstAddr, e, sizeof(e));
-+                    std::fprintf(stderr, "[sif] EE->IOP cid=0x%x code=%08x %08x %08x %08x extra=%u@%08x: %08x %08x %08x\n", cid,
-+                                 w[0], w[1], w[2], w[3], size, dstAddr, e[0], e[1], e[2]);
++                    uint8_t e[48] = {};
++                    const size_t en = std::min<size_t>(size, sizeof(e));
++                    if (en != 0u)
++                        (void)runtime->readIopMemory(dstAddr, e, en);
++                    std::fprintf(stderr, "[sif %llu] EE->IOP cid=0x%x code=%08x %08x %08x %08x extra=%u@%08x:%s\n", sifLogMicros(), cid, w[0], w[1],
++                                 w[2], w[3], size, dstAddr, describeExtra(e, en).c_str());
 +                }
 +                if (!runtime->sendIopSifCommand(packet, packetSize))
 +                {
@@ -1107,7 +1282,7 @@ index dc975ed..2e5be07 100644
          setReturnS32(ctx, 1);
      }
  
-@@ -226,14 +279,65 @@ namespace ps2_stubs
+@@ -226,14 +314,62 @@ namespace ps2_stubs
          seedDefaultSifRegsLocked();
      }
  
@@ -1152,11 +1327,8 @@ index dc975ed..2e5be07 100644
 +        {
 +            uint32_t w[4] = {};
 +            std::memcpy(w, static_cast<const uint8_t *>(packet) + 12u, std::min<size_t>(16u, packetSize - 12u));
-+            uint32_t e[3] = {};
-+            if (extra)
-+                std::memcpy(e, extra, std::min<size_t>(sizeof(e), extraSize));
-+            std::fprintf(stderr, "[sif] IOP->EE cid=0x%x code=%08x %08x %08x %08x extra=%zu@%08x: %08x %08x %08x\n", commandId,
-+                         w[0], w[1], w[2], w[3], extraSize, extraDestination, e[0], e[1], e[2]);
++            std::fprintf(stderr, "[sif %llu] IOP->EE dispatch cid=0x%x code=%08x %08x %08x %08x extra=%zu@%08x:%s\n", sifLogMicros(), commandId, w[0], w[1],
++                         w[2], w[3], extraSize, extraDestination, extra ? describeExtra(extra, extraSize).c_str() : "");
 +        }
 +
 +        // System command SIF_CMD_SET_SREG (cid 0x80000001, packet: header, u32 index, u32 value). libsif's own system
@@ -1174,16 +1346,19 @@ index dc975ed..2e5be07 100644
  
          SifCmdHandler registered{};
          {
-@@ -279,7 +383,16 @@ namespace ps2_stubs
+@@ -279,7 +415,19 @@ namespace ps2_stubs
              {
                  runtime->guestFree(packetAddress);
              };
 +            if (extra && extraSize)
 +            {
 +                std::vector<uint8_t> data(extra, extra + extraSize);
-+                invocation.onStart = [rdram, extraDestination, data = std::move(data)]()
++                const uint32_t code = static_cast<const uint32_t *>(packet)[3];
++                invocation.onStart = [rdram, extraDestination, code, data = std::move(data)]()
 +                {
 +                    writeSifExtra(rdram, extraDestination, data.data(), data.size());
++                    if (sifLogOn())
++                        std::fprintf(stderr, "[sif %llu] IOP->EE handler starts code=%08x\n", sifLogMicros(), code);
 +                };
 +            }
              runtime->eeScheduler().queueInvocation(std::move(invocation));
@@ -1192,23 +1367,27 @@ index dc975ed..2e5be07 100644
          }
          catch (...)
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
-index 8673e80..61ee9e0 100644
+index 8673e80..47d1309 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
-@@ -4,7 +4,10 @@
+@@ -4,7 +4,14 @@
  
  namespace ps2_stubs
  {
 -    bool dispatchSifCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t commandId, const void *packet, size_t packetSize) noexcept;
 +    // extra: the command's extra data, written to EE memory at extraDestination when the handler starts (or at once
 +    // when no handler takes the command, like the completed DMA it is).
++    // PS2X_SIF_LOG=1: SIF command/RPC trace; timestamps in microseconds since the first call.
++    bool sifLogEnabled() noexcept;
++    unsigned long long sifLogMicros() noexcept;
++
 +    bool dispatchSifCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t commandId, const void *packet, size_t packetSize,
 +                            uint32_t extraDestination = 0u, const uint8_t *extra = nullptr, size_t extraSize = 0u) noexcept;
      void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
      void sceSifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
      void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
-index 3dc8e0d..cef946c 100644
+index 3dc8e0d..795b014 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
 @@ -1,5 +1,6 @@
@@ -1218,7 +1397,23 @@ index 3dc8e0d..cef946c 100644
  #include "../../ps2_iop_transport.h"
  #include "../../ps2_iop_async.h"
  #include <chrono>
-@@ -1179,34 +1180,9 @@ namespace ps2_syscalls
+@@ -524,6 +525,15 @@ namespace ps2_syscalls
+         const uint32_t sendBuf = getRegU32(ctx, 7);
+         const uint32_t stackPointer = getRegU32(ctx, 29);
+ 
++        if (ps2_stubs::sifLogEnabled())
++        {
++            uint32_t w[4] = {};
++            for (int i = 0; i < 4; ++i)
++                if (const uint8_t *p = getConstMemPtr(rdram, sendBuf + 4u * i))
++                    std::memcpy(&w[i], p, 4);
++            std::fprintf(stderr, "[sif %llu] EE SifCallRpc client=%08x fn=%u mode=%u send=%08x: %08x %08x %08x %08x\n",
++                         ps2_stubs::sifLogMicros(), clientPtr, rpcNum, mode, sendBuf, w[0], w[1], w[2], w[3]);
++        }
+         const uint32_t sendSizeRegisters = getRegU32(ctx, 8);
+         const uint32_t receiveBufferRegisters = getRegU32(ctx, 9);
+         const uint32_t receiveSizeRegisters = getRegU32(ctx, 10);
+@@ -1179,34 +1189,9 @@ namespace ps2_syscalls
  
      void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
      {
@@ -1315,7 +1510,7 @@ index 9614016..1506659 100644
          setReturnU32(ctx, ret);
      }
 diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
-index 8132049..104f158 100644
+index 8132049..fe2fa99 100644
 --- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
 +++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
 @@ -573,6 +573,17 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
@@ -1346,7 +1541,20 @@ index 8132049..104f158 100644
              m_posted.push_back(std::move(posted));
              if (!m_postWakeQueued)
              {
-@@ -605,7 +619,10 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+@@ -594,6 +608,12 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+             }
+         }
+         m_postedTotal.fetch_add(1, std::memory_order_relaxed);
++        if (ps2_stubs::sifLogEnabled())
++        {
++            uint32_t code = 0u;
++            std::memcpy(&code, static_cast<const uint8_t *>(packet) + 12u, sizeof(code));
++            std::fprintf(stderr, "[sif %llu] IOP->EE posted cid=0x%x code=%08x\n", ps2_stubs::sifLogMicros(), commandId, code);
++        }
+         if (wake)
+             m_runtime.postEeEvent(EeEvent{EeEventType::Dmac, kIopPostedWorkEventId, 0u});
+         return true;
+@@ -605,7 +625,10 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
                                           &m_runtime,
                                           commandId,
                                           packet,
@@ -1358,7 +1566,7 @@ index 8132049..104f158 100644
  }
  
  void PS2IopHostAdapter::drainPosted()
-@@ -651,7 +668,10 @@ void PS2IopHostAdapter::drainPosted()
+@@ -651,7 +674,10 @@ void PS2IopHostAdapter::drainPosted()
                                              &m_runtime,
                                              command.commandId,
                                              command.packet.data(),
