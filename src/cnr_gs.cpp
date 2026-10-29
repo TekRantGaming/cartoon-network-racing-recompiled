@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include <map>
 #include <string>
 #include <tuple>
+#include <vector>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -89,7 +91,7 @@ namespace
         // Auto: smallest multiple of 448 lines that covers the window height.
         k.upscale = c.upscale > 0 ? c.upscale : std::clamp((std::max(windowHeight, 448) + 447) / 448, 1, 8);
         k.vsync = c.vsync;
-        k.aspect = KzgsAspect::Ratio4_3;
+        k.aspect = KzgsAspect::Ratio4_3; // wide frames: kzgsSetWideRatio
         // Off: full-frame output is never deinterlaced by PCSX2's Automatic mode, and other modes shift or blur it.
         k.interlaceMode = 1;
         // PCSX2's vertex-shader sprite expansion corrupts frames on NVIDIA under D3D11.
@@ -133,7 +135,9 @@ namespace
     {
         std::vector<uint8_t> rgba;
         int w = 0, h = 0;
-        if (!kzgsReadback(rgba, w, h) || w <= 0 || h <= 0)
+        // As presented (aspect-corrected), 1280 wide: 16:9 frames 1280x720, 4:3 ones pillarboxed in it.
+        const int pw = s.cfg.widescreen ? 1280 : 0, ph = s.cfg.widescreen ? 720 : 0;
+        if (!kzgsReadback(rgba, w, h, pw, ph) || w <= 0 || h <= 0)
             return;
         for (size_t i = 3; i < rgba.size(); i += 4)
             rgba[i] = 0xFF;
@@ -239,10 +243,208 @@ namespace
         }
     }
 
+    // CNR_GS_DUMP=<seconds>: write the GIF packets of the first whole frame after that time to build/runs/gsdump.bin
+    // (records of u32 path, u32 bytes, data), for working out how a frame is drawn (scripts/gsdump.py).
+    struct GifDump
+    {
+        double at = std::getenv("CNR_GS_DUMP") ? std::atof(std::getenv("CNR_GS_DUMP")) : -1.0;
+        int state = 0; // 0 waiting, 1 armed (next vsync starts), 2 recording, 3 done
+        FILE *file = nullptr;
+    };
+
+    GifDump &gifDump()
+    {
+        static GifDump d;
+        return d;
+    }
+
+    void gifDumpOnVsync()
+    {
+        GifDump &d = gifDump();
+        if (d.at < 0.0 || d.state == 3)
+            return;
+        if (d.state == 2)
+        {
+            std::fclose(d.file);
+            d.state = 3;
+            std::fprintf(stderr, "[cnr] GIF frame dump written\n");
+        }
+        else if (d.state == 1)
+        {
+            std::filesystem::create_directories("build/runs");
+            d.file = std::fopen("build/runs/gsdump.bin", "wb");
+            d.state = d.file ? 2 : 3;
+        }
+        else if (std::chrono::duration<double>(std::chrono::steady_clock::now() - gs().start).count() >= d.at)
+            d.state = 1;
+    }
+
+    // Widescreen 2D. GIF-thread state: one thread feeds kzgs at a time, and the vsync job runs in order with the packets.
+    struct WideState
+    {
+        bool sawPath1 = false; // 3D (VU1, PATH1) drawn since the last presented frame: this frame is wide
+        bool lastWide = false;
+        uint32_t xyOffset[2] = {1728u << 4, 1728u << 4}; // XYOFFSET_1/2 OFX (12.4), tracked from every path
+        std::vector<uint8_t> scratch;
+    };
+
+    WideState &wide()
+    {
+        static WideState w;
+        return w;
+    }
+
+    // An XYZ register value in a GIF packet: X (12.4 fixed point) is the little-endian u16 at p in both the PACKED and
+    // the A+D/REGLIST layout.
+    struct XyRef
+    {
+        uint8_t *p;
+        int ctx;
+    };
+
+    // The game draws its 2D overlay (HUD, menus over 3D, pause screen) through PATH2 after the 3D, one GIF packet per
+    // element or glyph, in 640-pixel screen space. A wide frame is stretched by 4/3 when presented, so each packet's X
+    // coordinates are narrowed by 3/4 around the screen centre (with hudAtEdges: around the left or right edge for
+    // elements in the outer quarters). Full-width draws (screen fills, fades, frame copies) are left alone.
+    void narrowPacket2d(WideState &w, const CnrVideoConfig &cfg, uint8_t *pkt, uint32_t size)
+    {
+        std::vector<XyRef> refs;
+        int ctx = 0;
+        uint32_t off = 0;
+        while (off + 16 <= size)
+        {
+            uint64_t lo, hi;
+            std::memcpy(&lo, pkt + off, 8);
+            std::memcpy(&hi, pkt + off + 8, 8);
+            off += 16;
+            const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFF);
+            if ((lo >> 46) & 1)
+                ctx = static_cast<int>((lo >> 56) & 1); // tag PRIM field, CTXT = bit 9
+            const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3);
+            const uint32_t nreg = ((lo >> 60) & 0xF) ? static_cast<uint32_t>((lo >> 60) & 0xF) : 16u;
+            if (flg == 0) // PACKED
+            {
+                for (uint32_t l = 0; l < nloop; ++l)
+                    for (uint32_t r = 0; r < nreg && off + 16 <= size; ++r, off += 16)
+                    {
+                        const uint32_t reg = static_cast<uint32_t>((hi >> (4 * r)) & 0xF);
+                        const uint32_t addr = reg == 0xE ? pkt[off + 8] : reg;
+                        if (addr == 0x00) // PRIM
+                            ctx = (pkt[off + 1] >> 1) & 1;
+                        else if (reg == 0xE && (addr == 0x18 || addr == 0x19)) // XYOFFSET_1/2
+                            w.xyOffset[addr - 0x18] = pkt[off] | (pkt[off + 1] << 8);
+                        else if (addr == 0x04 || addr == 0x05 || addr == 0x0C || addr == 0x0D) // XYZF2/XYZ2/XYZF3/XYZ3
+                            refs.push_back({pkt + off, ctx});
+                    }
+            }
+            else if (flg == 1) // REGLIST
+            {
+                const uint32_t n = nloop * nreg;
+                for (uint32_t i = 0; i < n && off + 8 * i + 8 <= size; ++i)
+                {
+                    uint8_t *v = pkt + off + 8 * i;
+                    const uint32_t reg = static_cast<uint32_t>((hi >> (4 * (i % nreg))) & 0xF);
+                    if (reg == 0x0)
+                        ctx = (v[1] >> 1) & 1;
+                    else if (reg == 0x4 || reg == 0x5 || reg == 0xC || reg == 0xD)
+                        refs.push_back({v, ctx});
+                }
+                off += ((n + 1) / 2) * 16;
+            }
+            else // IMAGE
+                off += nloop * 16;
+            if ((lo >> 15) & 1)
+                break;
+        }
+        if (refs.empty())
+            return;
+        auto screenX = [&](const XyRef &r) {
+            const uint32_t x = r.p[0] | (r.p[1] << 8);
+            return (static_cast<float>(x) - static_cast<float>(w.xyOffset[r.ctx])) / 16.0f;
+        };
+        float x0 = 1e9f, x1 = -1e9f;
+        for (const XyRef &r : refs)
+        {
+            const float x = screenX(r);
+            x0 = std::min(x0, x);
+            x1 = std::max(x1, x);
+        }
+        if (x1 - x0 >= 600.0f)
+            return;
+        float anchor = 320.0f;
+        if (cfg.hudAtEdges)
+        {
+            const float centre = 0.5f * (x0 + x1);
+            anchor = centre < 160.0f ? 0.0f : centre > 480.0f ? 640.0f : 320.0f;
+        }
+        for (const XyRef &r : refs)
+        {
+            // Vertices on or beyond the screen's left/right edge stay there, so shapes that reach the edge (the menu
+            // transition's iris mask, panels sliding in) still cover the whole widened screen.
+            const float sx = screenX(r);
+            if (sx <= 0.5f || sx >= 639.5f)
+                continue;
+            const float x = anchor + (sx - anchor) * 0.75f;
+            const float fixed = std::clamp(x * 16.0f + static_cast<float>(w.xyOffset[r.ctx]), 0.0f, 65535.0f);
+            const uint32_t v = static_cast<uint32_t>(std::lround(fixed));
+            r.p[0] = static_cast<uint8_t>(v);
+            r.p[1] = static_cast<uint8_t>(v >> 8);
+        }
+    }
+
+    // XYOFFSET writes in packets that are not rewritten (PATH1 3D, PATH2 before the 3D).
+    void trackXyOffset(WideState &w, const uint8_t *pkt, uint32_t size)
+    {
+        uint32_t off = 0;
+        while (off + 16 <= size)
+        {
+            uint64_t lo, hi;
+            std::memcpy(&lo, pkt + off, 8);
+            std::memcpy(&hi, pkt + off + 8, 8);
+            off += 16;
+            const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFF);
+            const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3);
+            const uint32_t nreg = ((lo >> 60) & 0xF) ? static_cast<uint32_t>((lo >> 60) & 0xF) : 16u;
+            if (flg == 0)
+            {
+                for (uint32_t l = 0; l < nloop; ++l)
+                    for (uint32_t r = 0; r < nreg && off + 16 <= size; ++r, off += 16)
+                        if (((hi >> (4 * r)) & 0xF) == 0xE && (pkt[off + 8] == 0x18 || pkt[off + 8] == 0x19))
+                            w.xyOffset[pkt[off + 8] - 0x18] = pkt[off] | (pkt[off + 1] << 8);
+            }
+            else if (flg == 1)
+                off += ((nloop * nreg + 1) / 2) * 16;
+            else
+                off += nloop * 16;
+            if ((lo >> 15) & 1)
+                break;
+        }
+    }
+
     void onGifPacket(int path, const uint8_t *data, uint32_t sizeBytes)
     {
+        if (GsState &gst = gs(); gst.cfg.widescreen)
+        {
+            WideState &w = wide();
+            if (path == 1)
+                w.sawPath1 = true;
+            if (path == 2 && w.sawPath1)
+            {
+                w.scratch.assign(data, data + sizeBytes);
+                narrowPacket2d(w, gst.cfg, w.scratch.data(), sizeBytes);
+                data = w.scratch.data();
+            }
+            else if (path != 3)
+                trackXyOffset(w, data, sizeBytes);
+        }
         if (formats().enabled)
             inspectFormats(path, data, sizeBytes);
+        if (GifDump &d = gifDump(); d.state == 2)
+        {
+            const uint32_t hdr[2] = {static_cast<uint32_t>(path), sizeBytes};
+            std::fwrite(hdr, sizeof(hdr), 1, d.file);
+            std::fwrite(data, 1, sizeBytes, d.file);
+        }
         kzgsGifTransfer(path, data, sizeBytes / 16u);
         // One thread feeds kzgs at a time (the VIF1 worker, or the EE thread with the worker idle): no locked add needed.
         GsState &s = gs();
@@ -271,6 +473,7 @@ namespace
             }
         }
         std::memcpy(s.privRegs, job->regs, sizeof(s.privRegs));
+        gifDumpOnVsync();
         // Unchanged frames (no new packets, same display registers) are not presented again. A busy GS thread drops this
         // vblank's presentation instead of blocking the EE; the next vblank shows the newest frame.
         static uint8_t lastDisplayRegs[0xF0] = {};
@@ -279,11 +482,15 @@ namespace
         const bool regsChanged = std::memcmp(lastDisplayRegs, s.privRegs, sizeof(lastDisplayRegs)) != 0;
         if (!presentedOnce || newPackets || regsChanged)
         {
-            if (kzgsVsyncTry(job->field, regsChanged || !presentedOnce))
+            WideState &w = wide();
+            const bool isWide = s.cfg.widescreen && (newPackets ? w.sawPath1 : w.lastWide);
+            if (kzgsVsyncTry(job->field, regsChanged || !presentedOnce, isWide))
             {
                 s.packetsSinceVsync.store(0, std::memory_order_relaxed);
                 std::memcpy(lastDisplayRegs, s.privRegs, sizeof(lastDisplayRegs));
                 presentedOnce = true;
+                w.lastWide = isWide;
+                w.sawPath1 = false;
             }
         }
         s.frames.fetch_add(1, std::memory_order_relaxed);
@@ -344,6 +551,7 @@ bool cnrGsAttach(PS2Runtime &runtime, void *hwnd, int windowWidth, int windowHei
     const KzgsConfig kc = toKzgs(cfg, windowHeight);
     if (!kzgsOpen(hwnd, kc, s.privRegs, error))
         return false;
+    kzgsSetWideRatio(cfg.widescreen ? 16.0f / 9.0f : 0.0f);
     runtime.gs().setRasterBackend(std::make_unique<SkipDrawBackend>());
     PS2HostGs hooks;
     hooks.gifPacket = &onGifPacket;

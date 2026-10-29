@@ -19,6 +19,12 @@ struct CnrVideoConfig
     int upscale = 0; // 0 = auto from the window height
     bool vsync = true;
     bool pal = false; // EU disc: PAL CRTC fallbacks (50 Hz)
+    // 16:9: frames with 3D (widened camera, src/cnr_overrides.cpp) are presented at 16:9 with their 2D overlay narrowed
+    // back to its 4:3 proportions; 2D-only frames (movies, loading screens) stay 4:3, pillarboxed.
+    bool widescreen = true;
+    // widescreen: HUD elements in the outer quarters keep to the screen edges (false: everything in the centre 4:3 area).
+    // 2D markers placed over world positions (e.g. an opponent tag) end up slightly off their target either way.
+    bool hudAtEdges = true;
 };
 
 bool cnrGsAttach(PS2Runtime &runtime, void *hwnd, int windowWidth, int windowHeight, const CnrVideoConfig &cfg, std::string *error);

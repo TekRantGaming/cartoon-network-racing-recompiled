@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <iostream>
 
@@ -73,8 +74,30 @@ namespace
         g_syncVOrig(rdram, ctx, runtime);
     }
 
+    // 16:9 Hor+ (CNR_WIDESCREEN=0: off). The camera setup FUN_0033ecf8 (EU 0x33EC58) builds the projection from a
+    // constant table K (USA 0x4C4C58, EU 0x4C4C68; = 1, 1, 4/3): x scale = K[1] / tan(fov / 2), y scale from K[0], K[2]
+    // and the viewport. Nothing else reads K[1], so K[1] = 3/4 widens the horizontal view by 4/3 and keeps the vertical one.
+    void applyWidescreen(PS2Runtime &runtime, bool eu)
+    {
+        const char *v = std::getenv("CNR_WIDESCREEN");
+        if (v && v[0] == '0')
+            return;
+        const uint32_t k1 = eu ? 0x004C4C6Cu : 0x004C4C5Cu;
+        uint8_t *rdram = runtime.memory().getRDRAM();
+        float value;
+        std::memcpy(&value, rdram + k1, sizeof(value));
+        if (value != 1.0f)
+        {
+            std::cerr << "[cnr] widescreen: unexpected projection constant " << value << ", left alone" << std::endl;
+            return;
+        }
+        value = 0.75f;
+        std::memcpy(rdram + k1, &value, sizeof(value));
+    }
+
     void apply(PS2Runtime &runtime, bool eu)
     {
+        applyWidescreen(runtime, eu);
         for (const Binding &b : kBindings)
         {
             const uint32_t addr = eu ? b.eu : b.usa;

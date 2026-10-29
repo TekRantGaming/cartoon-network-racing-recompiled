@@ -13,6 +13,8 @@
 //   CNR_SHOT_DIR=<dir>     save the GS output as PNG every CNR_SHOT_INTERVAL seconds (default 5)
 //   CNR_RENDERER=d3d11|d3d12|vulkan, CNR_UPSCALE=<1..8>
 //   CNR_GS=cpu             the runtime's software GS instead of PCSX2's (PS2X_HEADLESS_SHOTS for frames)
+//   CNR_WIDESCREEN=0       original 4:3 instead of 16:9 Hor+; CNR_HUD_CENTRE=1: the 16:9 HUD stays in the centre 4:3 area
+//   CNR_GS_DUMP=<s>        write one frame's GIF packets (scripts/gsdump.py); CNR_FRAME_STATS=1: game frames/s
 
 #include "cnr_audio.h"
 #include "cnr_gs.h"
@@ -88,6 +90,8 @@ namespace
             cfg.renderer = _stricmp(r, "d3d12") == 0 ? CnrRenderer::D3D12 : _stricmp(r, "vulkan") == 0 ? CnrRenderer::Vulkan : CnrRenderer::D3D11;
         if (const char *u = std::getenv("CNR_UPSCALE"))
             cfg.upscale = std::atoi(u);
+        cfg.widescreen = !(std::getenv("CNR_WIDESCREEN") && std::getenv("CNR_WIDESCREEN")[0] == '0');
+        cfg.hudAtEdges = !envOn("CNR_HUD_CENTRE");
         return cfg;
     }
 
@@ -160,7 +164,8 @@ int main(int argc, char *argv[])
             fail(nullptr, std::string("SDL video init failed: ") + SDL_GetError());
             return 1;
         }
-        int winW = 1280, winH = 960;
+        const bool widescreen = !(std::getenv("CNR_WIDESCREEN") && std::getenv("CNR_WIDESCREEN")[0] == '0');
+        int winW = 1280, winH = widescreen ? 720 : 960;
         SDL_Window *window = SDL_CreateWindow("Cartoon Network Racing", winW, winH,
                                               headless ? SDL_WINDOW_HIDDEN : (SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY));
         if (!window)

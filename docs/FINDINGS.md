@@ -112,3 +112,27 @@ scheduler's idle wait (`EeScheduler::waitForEvent`) overslept by a whole 15.6 ms
 Two scheduler safeguards from the investigation stay in (no measurable effect once the timer was fixed): the idle wait
 wakes for the earliest event by host time (`PS2X_IDLE_WAKE_BY_CYCLE=1` reverts), and a vblank's cycle deadline is
 clamped to the cycle the wall-clock floor reaches at its host deadline (`PS2X_VBLANK_CYCLE_CLAMP=0` reverts).
+
+## Widescreen (16:9 Hor+)
+
+On by default; `CNR_WIDESCREEN=0` restores 4:3. Starting point: the PCSX2 patch database's widescreen patch for this game
+(PCSX2/pcsx2_patches `SLUS-21438_EAE72CFE.pnach` / `SLES-54306_CB4B48AF.pnach`, by Arapapa), which patches the camera
+setup FUN_0033ecf8 (EU FUN_0033ec58). Patching code bytes does nothing in a recompile, so the same place was worked out
+instead:
+
+* FUN_0033ecf8 builds the projection from fov and a constant table K (USA 0x4C4C58, EU 0x4C4C68; values 1, 1, 4/3):
+  x scale = K[1] / tan(fov/2) (0x33F0B4..0x33F0E4), y scale from K[0], K[2] and the viewport size. Only this function
+  reads K[1]. `src/cnr_overrides.cpp` sets K[1] = 0.75 at load: horizontal view x4/3, vertical unchanged (true Hor+).
+  The function runs every frame in movies, menus and races alike, so it cannot tell races from menus.
+* Presentation (`src/cnr_gs.cpp`): a frame is "wide" when it drew 3D through PATH1 (VU1). Wide frames are presented at
+  16:9 (kzgs wide ratio), all others (movies, title, loading screens, 2D-only menus) at 4:3 pillarboxed.
+* 2D: the game draws its overlay through PATH2 after the 3D, one GIF packet per element or glyph, in 640-pixel screen
+  coordinates (XYOFFSET 1728). In wide frames each such packet's X coordinates are narrowed by 3/4: elements whose centre
+  is in the outer quarter of the screen around that edge (HUD to the corners; `CNR_HUD_CENTRE=1`: everything around
+  the centre), the rest around the centre. Packets at least 600 px wide (screen fills, fades, frame copies) are left
+  alone, and vertices on the screen's left/right edge stay there, so the menu transition's iris mask still covers
+  the whole screen. PATH2 before the 3D (frame-start copies) is not touched.
+* Known limitation: 2D markers drawn over world positions (the "REVENGE" tag above an opponent) move a little off
+  their target, like any HUD element of their quarter.
+* `CNR_GS_DUMP=<seconds>` writes one frame's GIF packets to `build/runs/gsdump.bin`; `scripts/gsdump.py` lists the
+  draws (path, primitive, texture, vertex count, screen box).
