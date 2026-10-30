@@ -4,7 +4,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(CnrLauncher C CXX)
 
-set(CNR_LAUNCHER_VERSION 1.0.0)
+# The project's version: shown in the launcher, compared with releases, and checked by scripts/make_release.py.
+file(STRINGS ../VERSION CNR_LAUNCHER_VERSION LIMIT_COUNT 1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ../VERSION)
 string(REPLACE "." "," _commas "${CNR_LAUNCHER_VERSION}")
 
 # The launcher runs on its own: no Visual C++ runtime needed beside it.

@@ -65,7 +65,7 @@ index 5ef7d4a..0ed6c7f 100644
  
  The install page and the About section show the copy the port was made with: version, file name, size, SHA1, MD5,
 diff --git a/launcher2/include/trg/hub.h b/launcher2/include/trg/hub.h
-index 39fa649..7f4a322 100644
+index 39fa649..07ec8c1 100644
 --- a/launcher2/include/trg/hub.h
 +++ b/launcher2/include/trg/hub.h
 @@ -7,13 +7,15 @@
@@ -211,7 +211,7 @@ index 39fa649..7f4a322 100644
    const char* installed_size;  // "about 1.6 GB"
    // The game turns its camera with the mouse itself (its own mouse look hook): its Keyboard and mouse section shows
    // <prefix>mouse_sensitivity and <prefix>mouse_invert_y instead of the runtime's mouse to stick sensitivity.
-@@ -58,6 +163,22 @@ struct GameInfo {
+@@ -58,6 +163,24 @@ struct GameInfo {
    // for them, separated by commas ("720,1080"); nullptr: 720 only. Other sizes use the runtime's draw scale. (The
    // game side must then keep the video mode the launcher writes; shared/render_quality.cpp sets 1280 x 720.)
    const char* native_heights = nullptr;
@@ -228,13 +228,15 @@ index 39fa649..7f4a322 100644
 +  const char* saves_folder = nullptr;
 +  // "USA", "Europe": for a project with one game in several regions. Shown on the game's tile and in its status line.
 +  const char* tag = nullptr;
++  // The game is built for processors with AVX2. Play says so on a processor without it, instead of the game crashing.
++  bool needs_avx2 = false;
 +  // The game's own settings. Not empty: these sections replace Display, Graphics, Controller, Keyboard and mouse and
 +  // Audio, which are written for ReXGlue's runtime.
 +  std::vector<SettingsSection> settings;
  };
  
  // A tile on the Other TRG Projects page. Art links are full URLs (usually SteamGridDB); "" draws a plain card.
-@@ -84,6 +205,7 @@ struct Features {
+@@ -84,6 +207,7 @@ struct Features {
    // video mode for GameInfo::native_heights, the draw scale for the rest) and the window's size. The upscaler modes
    // scale from it too (game_side/shared/render_quality.cpp). Off: the two separate rows.
    bool output_resolution = true;
@@ -242,7 +244,7 @@ index 39fa649..7f4a322 100644
  };
  
  struct ProjectConfig {
-@@ -102,7 +224,8 @@ struct ProjectConfig {
+@@ -102,7 +226,8 @@ struct ProjectConfig {
  
    std::vector<GameInfo> games;
  
@@ -253,10 +255,45 @@ index 39fa649..7f4a322 100644
    std::string packages_tag_prefix = "packages-v";  // the release the launcher downloads from
    std::string launcher_zip;   // "WhoppingCollection": its update is <zip>-<version>-windows-x64.zip (Windows) or
 diff --git a/launcher2/src/app.cpp b/launcher2/src/app.cpp
-index 7387900..d22ea9a 100644
+index 7387900..d7b4e0f 100644
 --- a/launcher2/src/app.cpp
 +++ b/launcher2/src/app.cpp
-@@ -120,13 +120,14 @@ void App::Start() {
+@@ -6,6 +6,10 @@
+ 
+ #include <filesystem>
+ 
++#if defined(_MSC_VER)
++#include <intrin.h>
++#endif
++
+ #if defined(_WIN32)
+ #include <windows.h>
+ #else
+@@ -23,6 +27,23 @@ namespace {
+ 
+ std::wstring Wide(const std::string& utf8) { return fs::u8path(utf8).make_preferred().wstring(); }
+ 
++// The processor has AVX2 and Windows saves its registers. From CPUID: Windows' own check only knows it on newer builds.
++bool HasAvx2() {
++#if defined(_MSC_VER)
++  int r[4] = {};
++  __cpuid(r, 0);
++  if (r[0] < 7) return false;
++  __cpuid(r, 1);
++  const int kOsxsave = 1 << 27, kAvx = 1 << 28;
++  if ((r[2] & kOsxsave) == 0 || (r[2] & kAvx) == 0) return false;
++  if ((_xgetbv(0) & 6) != 6) return false;
++  __cpuidex(r, 7, 0);
++  return (r[1] & (1 << 5)) != 0;
++#else
++  return true;
++#endif
++}
++
+ }  // namespace
+ 
+ App::App(AppOptions options, UploadFn upload, SDL_Window* window)
+@@ -120,13 +141,14 @@ void App::Start() {
      // Updates install by themselves ("update them automatically when a new
      // version has been released"); the launcher checks once at startup.
  #if defined(_WIN32)  // on Linux the games come inside the launcher's AppImage and update with it
@@ -273,7 +310,7 @@ index 7387900..d22ea9a 100644
    } else {
      g_art_downloads_allowed = false;
      art_->Start();  // still loads what is cached; downloads are skipped while offline
-@@ -205,7 +206,7 @@ void App::OpenGameSettings(int game, const char* section) {
+@@ -205,7 +227,7 @@ void App::OpenGameSettings(int game, const char* section) {
    gu.achievements.loaded = false;  // read again: the game may have unlocked some since
    gu.settings_view.in_rows = false;
    if (section) {
@@ -282,7 +319,7 @@ index 7387900..d22ea9a 100644
      if (s >= 0) {
        gu.settings_view.section = s;
        gu.settings_view.in_rows = true;
-@@ -245,6 +246,7 @@ void App::PrimaryAction(int game) {
+@@ -245,6 +267,7 @@ void App::PrimaryAction(int game) {
    }
    switch (states_[game]) {
      case GameState::kNotDownloaded:
@@ -290,7 +327,17 @@ index 7387900..d22ea9a 100644
        StartDownload(Games()[game], games_[game]->jobs);
        break;
      case GameState::kDownloaded:
-@@ -328,7 +330,10 @@ bool App::LaunchGame(int game) {
+@@ -322,13 +345,20 @@ bool App::LaunchGame(int game) {
+     return false;
+   }
+   const GameInfo& g = Games()[game];
++  if (g.needs_avx2 && !HasAvx2()) {
++    SetToast(std::string(g.title) + " needs a processor with AVX2, and this PC's does not have it.", true);
++    return false;
++  }
+   std::vector<std::string> args = {"--game_data_root=" + GameDataDir(g)};
+   // Back and Start, or holding Esc, closes the game (game_side/return_to_launcher.cpp).
+   if (!Project().from_launcher_flag.empty()) args.push_back(Project().from_launcher_flag);
    // Testing (--test-play): never the player's own saves in Documents, a private folder instead.
    if (options_.test_play >= 0) args.push_back("--user_data_root=" + LauncherDir() + "/test-userdata");
    // Features::output_resolution: the default size is written before the first Play, so the game gets it too.
@@ -302,7 +349,7 @@ index 7387900..d22ea9a 100644
    return Launch(GameExePath(g), GameDir(g), args, g.title, game);
  }
  
-@@ -457,7 +462,7 @@ void App::PollSelfUpdate() {
+@@ -457,7 +487,7 @@ void App::PollSelfUpdate() {
        if (up.report.installed) up.check.found.reset();
      }
    }

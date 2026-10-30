@@ -65,6 +65,21 @@ python scripts/stage_launcher.py
 and the launcher's install step puts the player's disc in `game/` beside them. Saves stay in each game's `saves/` folder.
 Staging again replaces the programs and keeps the disc, settings, saves and shader cache.
 
+## Make a release
+
+Set `VERSION`, build both games, then:
+
+```bash
+python scripts/make_release.py
+python scripts/make_release.py --earlier 1.0.0
+```
+
+The first line is for the first release; later ones name the version before them, so updates can remove what is gone. It
+writes `release/v<version>/`: the players' zip (GitHub tag `v<version>`) and `packages/` (tag `packages-v<version>`), which
+is what the launcher downloads. Publish the packages release first, so the players' release is the newest on the page.
+The repository must be public, as the launcher asks GitHub without signing in. Put every zip through VirusTotal first, and
+keep every published zip: the next release needs them. The rules are in `ext/trg-launcher/docs/UPDATER.md`.
+
 ## Run
 
 From the project root: `build/cnr/cnr.exe` (defaults to `extracted/usa/SLUS_214.38` and the USA ISO in `game files/`),

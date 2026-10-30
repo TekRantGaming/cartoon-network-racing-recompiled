@@ -166,6 +166,7 @@ ProjectConfig CartoonNetworkRacing() {
   usa.installed_file = "SLUS_214.38";
   usa.saves_folder = "saves";
   usa.tag = "USA";
+  usa.needs_avx2 = true;
   usa.settings = GameSettings(false);
 
   GameInfo eu = {
@@ -179,17 +180,23 @@ ProjectConfig CartoonNetworkRacing() {
   eu.installed_file = "SLES_543.06";
   eu.saves_folder = "saves";
   eu.tag = "Europe";
+  eu.needs_avx2 = true;
   eu.settings = GameSettings(true);
   p.games = {usa, eu};
 
-  // No releases yet: p.repo stays empty, which turns updates off. With the first release, set p.repo
-  // (TekRantGaming/cartoon-network-racing-recompiled), launcher_zip and steam_art_base here.
+  // Releases: vX holds CartoonNetworkRacing-vX-windows-x64.zip for players; packages-vX holds what the launcher downloads
+  // (CartoonNetworkRacing-, CartoonNetworkRacingUSA-, CartoonNetworkRacingEU-vX-windows-x64.zip, SHA256SUMS.txt). The repo
+  // must be public: the launcher asks GitHub without signing in. scripts/make_release.py makes all of them.
+  p.repo = "TekRantGaming/cartoon-network-racing-recompiled";
+  p.packages_tag_prefix = "packages-v";
+  p.launcher_zip = "CartoonNetworkRacing";
   p.launcher_exe = "cnr_launcher";
   p.linux_data_folder = "cartoon_network_racing";
 
   p.setting_prefix = "cnr_";
   p.from_launcher_flag = "--cnr_from_launcher=true";
   p.test_background_env = "CNR_TEST_BACKGROUND";
+  p.release_server_env = "CNR_RELEASE_SERVER";
   p.features.frame_rate = false;
   p.features.render_quality = false;
   p.features.controller_options = false;
@@ -198,6 +205,7 @@ ProjectConfig CartoonNetworkRacing() {
   p.features.achievements = false;
 
   p.discord_url = "https://discord.gg/8eakYSvBZS";
+  p.steam_art_base = "https://raw.githubusercontent.com/TekRantGaming/cartoon-network-racing-recompiled/main/docs/steam/";
   return p;
 }
 

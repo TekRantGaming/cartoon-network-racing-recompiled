@@ -4,8 +4,12 @@
 
 ### Cartoon Network Racing on PC, running natively, in widescreen and at high frame rates, from your own PlayStation 2 disc.
 
+[<img src="https://img.shields.io/badge/Download-Windows%20x64-ffc72c?style=for-the-badge&logo=windows&logoColor=white&labelColor=1a0c04" alt="Download for Windows" height="44">](https://github.com/TekRantGaming/cartoon-network-racing-recompiled/releases/latest)
+&nbsp;
 [<img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?style=for-the-badge&logo=discord&logoColor=white&labelColor=1a0c04" alt="Join the Discord" height="44">](https://discord.gg/8eakYSvBZS)
 
+[![Latest release](https://img.shields.io/github/v/release/TekRantGaming/cartoon-network-racing-recompiled?style=flat-square&label=release&color=ffc72c&labelColor=1a0c04)](https://github.com/TekRantGaming/cartoon-network-racing-recompiled/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/TekRantGaming/cartoon-network-racing-recompiled/total?style=flat-square&color=d62300&labelColor=1a0c04)](https://github.com/TekRantGaming/cartoon-network-racing-recompiled/releases)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-5b7a8c?style=flat-square&labelColor=1a0c04)
 ![Regions](https://img.shields.io/badge/discs-USA%20%7C%20Europe-ffc72c?style=flat-square&labelColor=1a0c04)
 ![Licence](https://img.shields.io/badge/licence-GPL--3.0-d62300?style=flat-square&labelColor=1a0c04)
@@ -24,9 +28,6 @@
 
 <br>
 
-> [!NOTE]
-> **There is no download yet.** The first release is still to come, so for now the game has to be [built from source](docs/BUILDING.md), which also needs your own disc.
-
 ## At a glance
 
 | | | |
@@ -35,6 +36,7 @@
 | 🏁 **True 16:9** that shows more of the track, and 4:3 if you prefer | ⚡ **Up to 165 frames a second**, with the game at its normal speed | ✨ **FXAA, SMAA**, sharpening, TV filters and colour controls |
 | 🎮 **Any controller** with button remapping and vibration | ⌨️ **Keyboard** with your own keys | ↩️ **Back to the launcher** any time: hold Back + Start, or Esc |
 | 💾 **Saves beside the game**, with backups and restore in one click | 🛋️ **A console style dashboard**, made for a controller | 🪟 **Borderless fullscreen**, windowed, any monitor |
+| 🔄 **Updates itself**, and keeps your saves and settings | 🚂 **Add to Steam** with its own artwork | 💬 **[Join the Discord](https://discord.gg/8eakYSvBZS)** right from Home |
 
 ## The game
 
@@ -57,8 +59,8 @@
 
 **You need:** Windows 10 or 11 (64 bit), a processor with AVX2, a graphics card with Direct3D 11, and a disc image you made from your own USA or European disc (see [Which discs work](#which-discs-work)).
 
-1. Build the launcher and games ([docs/BUILDING.md](docs/BUILDING.md)). The result is one folder, `dist/CartoonNetworkRacing`, that you can move anywhere.
-2. Run **cnr_launcher.exe**. It opens in fullscreen on Home.
+1. Download **CartoonNetworkRacing-...-windows-x64.zip** from the [latest release](https://github.com/TekRantGaming/cartoon-network-racing-recompiled/releases/latest) and unzip it anywhere. It holds the launcher and both versions of the game, and everything stays in that folder, so it's portable.
+2. Run **cnr_launcher.exe**. It opens in fullscreen on Home. Windows may warn about an unknown publisher the first time: choose **More info**, then **Run anyway**.
 3. Pick your region and press **Play**. The first time, the launcher asks for your disc image: it finds disc images on your PC by itself (or choose the file), checks that it is the right disc and sets the game up.
 4. Press **Play** again, and from then on it starts straight away.
 
@@ -92,6 +94,7 @@ Everything is set up before the game starts, with a controller, the keyboard or 
 - **Both regions** side by side, labelled USA and Europe
 - Each one shows at a glance whether it's **ready to play**
 - **Other TRG Projects**, **Discord** and **Settings**
+- **Add to Steam**: adds the game to your Steam library with its own artwork. Steam closes for a moment while it's added and opens again afterwards
 - Plays with a **controller**, the **keyboard** or the **mouse**, with interface sounds
 
 </td>
@@ -171,6 +174,10 @@ Everything is set up before the game starts, with a controller, the keyboard or 
 </tr>
 </table>
 
+### Updates
+
+When the launcher opens it checks GitHub for new versions of itself and of each game and **installs them by themselves**, restarting into a new launcher once nothing else is going on. Your disc, saves and settings stay as they are. Turn that off in the launcher's own **Settings**.
+
 ## PlayStation 2 vs PC
 
 | | PlayStation 2 | PC |
@@ -216,7 +223,7 @@ Please open an [issue](https://github.com/TekRantGaming/cartoon-network-racing-r
 <details>
 <summary><b>Building from source (for developers)</b></summary>
 
-See [docs/BUILDING.md](docs/BUILDING.md). The game code is generated from each disc's own program file, so building needs your own disc too. Nothing generated from the game is ever committed here. [docs/FINDINGS.md](docs/FINDINGS.md) has the reverse engineering notes behind each fix.
+See [docs/BUILDING.md](docs/BUILDING.md). The game code is generated from each disc's own program file, so building needs your own disc too. Nothing generated from the game is ever committed here, and the source code holds no game code or assets. [docs/FINDINGS.md](docs/FINDINGS.md) has the reverse engineering notes behind each fix.
 
 </details>
 
@@ -239,4 +246,4 @@ The code here is under the [GNU General Public License 3.0](LICENSE), as it buil
 > **AI disclosure:** this port was made almost entirely with Claude Code (Anthropic). The repository owner directed and tested the work; the AI did the analysis, code, tools and documentation.
 
 > [!IMPORTANT]
-> This project is not affiliated with or endorsed by Cartoon Network, Warner Bros. Discovery, Eutechnyx, The Game Factory or Sony. All trademarks belong to their owners. It contains no game code or assets. Do not open issues asking for game files.
+> This project is not affiliated with or endorsed by Cartoon Network, Warner Bros. Discovery, Eutechnyx, The Game Factory or Sony. All trademarks belong to their owners. The source code here contains no game code or assets. A release contains no original game files or assets either: its programs hold the game's code translated for PC, and everything else comes from your own disc. Do not open issues asking for game files.

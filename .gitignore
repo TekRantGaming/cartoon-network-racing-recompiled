@@ -10,6 +10,7 @@ SLES_*
 # Build output
 /build/
 /dist/
+/release/
 /out/
 
 # Downloaded third-party tools
