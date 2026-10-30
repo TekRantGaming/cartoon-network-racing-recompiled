@@ -248,6 +248,10 @@ int main(int argc, char *argv[])
         // itself, so the runtime's own guest buffers and interrupt stacks must stay out of it: they go into the unused
         // area below the ELF (loaded at 0x100000).
         ps2SetRuntimeArena(0x00080000u, 0x000B0000u, 0x000B0000u, 0x00100000u);
+        // The runtime's HLE pools (RPC/TLS tables, 0x31000 bytes) go into the unused EE kernel area as well, so the game's
+        // heap runs up to its top-of-RAM stack as on a PS2 (512 KB more; races ran out of heap without it).
+        if (!(std::getenv("CNR_POOLS") && std::getenv("CNR_POOLS")[0] == '0'))
+            ps2SetRuntimePools(0x00020000u);
         if (!runtime.loadELF(elf.string()))
         {
             fail(window, "failed to load ELF: " + elf.string());

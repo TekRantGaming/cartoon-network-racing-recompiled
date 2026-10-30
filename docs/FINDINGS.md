@@ -14,7 +14,7 @@ races, both regions. Rendering through PCSX2's hardware GS (D3D11), audio throug
   garbage first output line/column (1-pixel presentation crop).
 * Glitch sweep: attract-mode demos on six tracks (USA + EU), menus, profile flow, a full lap on Rocky Mountain Trail:
   no rendering faults seen.
-* Open: frame rates above 60 (`CNR_FPS`, experimental: races run at full speed but crash intermittently); world-anchored 2D markers
+* Frame rates above 60 (`CNR_FPS=90/120`): races start, run at full speed and no longer crash (see "Frame rates above 60").; world-anchored 2D markers
   sit slightly off in 16:9; a "WRONG WAY" sign was once captured without its text (not reproduced, may be its blink).
 
 ## IOP side (IOPMAIN.IRX, the game's own module)
@@ -174,12 +174,23 @@ world takes that step at race load (0x177ED4).
   At 60 Hz that is 2/60 s (the game clock 0x4C5658 still loses ~1.7% to occasional 3+-vblank hitches, as the original
   would); at 120 Hz the same cap lost ~4%. With `CNR_FPS` the function is replaced (`stepCount`) with the cap scaled to
   keep 2/60 s: game clock 10.009 s per 10 s at 120 Hz.
-* OPEN: races at 90/120 Hz crash intermittently (about 1 in 3 two-lap races at 120 Hz, first try at 90 Hz): the effect
-  node clone FUN_0033ffa0 gets 0 from the game allocator (0x22A840) for a child list and constructs at address 0 (call
-  to 0 at 0x340098). The heap (0x44E000-0x1F00000, ~26.3 MB of 27.9 MB in use in races at both rates) runs out; the
-  likely cause is effects spawned per simulation step (template 0xB91560 is cloned continually), so more are alive at a
-  higher rate. One run also jumped to 0x148 near the race end. Not seen at 60 Hz (400 s races). Next: find the spawner
-  and scale its rate, or rate-limit clones of the same template.
+* Crash (fixed): races at 90/120 Hz crashed intermittently (about 1 race in 3 at 120 Hz) in the effect-node clone
+  FUN_0033ffa0 (call to 0 at 0x340098): the node copy constructor's allocation (0x341A98, via the game allocator
+  0x229E80) returned 0. The game heap was nearly full at every rate: 20-55 KB free at race start, and a slow leak of
+  cloned "cratesmash" effects (crate smash handler FUN_001ab218 -> FUN_001ac028, ~200 B/s at 60 Hz) used it up; a
+  140 KB allocation in the race HUD (caller 0x1613B0, the position ladder with driver portraits) failed even at 60 Hz,
+  so that HUD element never appeared. Cause: the runtime's memory layout. The game's crt0 calls SetupThread(stack -1,
+  size 0x80000) and SetupHeap(0x640644, -1); the PS2 kernel puts that stack at [32 MB - 512 KB, 32 MB) and the heap runs
+  up to it (0x1F80000). The runtime put the stack pointer at 0x1F80000 (the stack below it) and ended "rest of RAM" heaps
+  at 0x1F00000, where its own HLE pools live (RPC packets/servers, TLS, boot-mode table, 0x31000 bytes): the game lost
+  512 KB. `ps2SetRuntimePools` now moves those pools (CNR: 0x20000, in the unused EE kernel area, `CNR_POOLS=0` keeps the
+  old layout), and with them moved SetupThread/SetupHeap use the PS2 layout. Races now have ~300-350 KB free, the HUD
+  position ladder appears, and 120 Hz races ran 6 of 6 crash-free (USA), plus 400 s runs at 90 Hz USA, 120 Hz EU, 60 Hz.
+* Seen twice in ~50 boots (USA once, EU once, before and after these changes): the boot stays on its first "Loading"
+  screen with the game otherwise running. Two instances run side by side also froze after the first logo movie twice.
+  Not investigated yet.
+* Debug: `CNR_HEAP_LOG=1` (USA) logs heap use/free once a second and every failed allocation with its caller;
+  `CNR_HEAP_TRACK=1` adds live allocations by caller (leak hunting).
 * Debug aids from this: `CNR_RAMDUMP=<s>,<s>` (EE RAM to build/runs/ram_<s>.bin), scripts/xref.py (code that builds an
   address), scripts/vtable.py.
 * The runtime's automatic EE cycle scale (60 / vblank rate) is needed: with `PS2X_EE_CYCLE_SCALE=1` frames span

@@ -18,6 +18,9 @@
 #include <iterator>
 #include <iostream>
 #include <string>
+#include <tuple>
+#include <vector>
+#include <unordered_map>
 
 namespace
 {
@@ -107,8 +110,158 @@ namespace
         }
     }
 
+    // CNR_HEAP_LOG=1 (USA): once a second, the game heap's bytes in use (0x4C14A4), peak (0x4C14A8) and 0x4C1490.
+    bool g_heapLog = false;
+    void heapLog(uint8_t *rdram)
+    {
+        static auto last = std::chrono::steady_clock::now();
+        static const auto t0 = last;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::seconds(1))
+            return;
+        last = now;
+        uint32_t used, peak, count;
+        std::memcpy(&used, rdram + 0x004C14A4u, 4);
+        std::memcpy(&peak, rdram + 0x004C14A8u, 4);
+        std::memcpy(&count, rdram + 0x004C1490u, 4);
+        uint32_t freeBytes = 0, biggest = 0, blocks = 0;
+        for (uint32_t b = 0, i = 0; i < 100000u; ++i)
+        {
+            std::memcpy(&b, rdram + ((i == 0 ? 0x005ADD48u : b) + 8u), 4);
+            if (b == 0x005ADD48u || b == 0u)
+                break;
+            uint32_t sz;
+            std::memcpy(&sz, rdram + (b & 0x01FFFFFCu), 4);
+            freeBytes += sz;
+            biggest = std::max(biggest, sz);
+            ++blocks;
+        }
+        (void)count;
+        std::fprintf(stderr, "[heap] t=%.0f used %u peak %u free %u in %u blocks, biggest %u\n",
+                     std::chrono::duration<double>(now - t0).count(), used, peak, freeBytes, blocks, biggest);
+    }
+
+    // DEBUG (CNR_HEAP_LOG=1): allocation failures of the game allocator 0x229E80 (a0 align, a1 size), with the free
+    // list (sentinel 0x5ADD48; block size at +0, next at +8) summarised.
+    PS2Runtime::RecompiledFunction g_allocOrig = nullptr;
+    PS2Runtime::RecompiledFunction g_freeOrig = nullptr;
+
+    // DEBUG (CNR_HEAP_TRACK=1, with CNR_HEAP_LOG=1): live allocations by caller; every 10 s the callers whose outstanding
+    // bytes grew the most since the previous report (leak hunting).
+    bool g_heapTrack = false;
+    std::chrono::steady_clock::time_point g_appliedAt = std::chrono::steady_clock::now();
+    struct LiveAlloc
+    {
+        uint32_t size, caller;
+    };
+    std::unordered_map<uint32_t, LiveAlloc> g_live;
+
+    void heapTrackReport()
+    {
+        static auto last = std::chrono::steady_clock::now();
+        static std::unordered_map<uint32_t, std::pair<int64_t, int64_t>> previous; // caller -> bytes, count
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::seconds(10))
+            return;
+        last = now;
+        std::unordered_map<uint32_t, std::pair<int64_t, int64_t>> current;
+        for (const auto &[ptr, a] : g_live)
+        {
+            auto &c = current[a.caller];
+            c.first += a.size;
+            c.second += 1;
+        }
+        std::vector<std::tuple<int64_t, int64_t, uint32_t, int64_t>> growth; // dbytes, dcount, caller, bytes
+        for (const auto &[caller, c] : current)
+        {
+            const auto it = previous.find(caller);
+            const int64_t db = c.first - (it == previous.end() ? 0 : it->second.first);
+            const int64_t dn = c.second - (it == previous.end() ? 0 : it->second.second);
+            if (db > 0)
+                growth.emplace_back(db, dn, caller, c.first);
+        }
+        std::sort(growth.begin(), growth.end(), [](const auto &a, const auto &b) { return std::get<0>(a) > std::get<0>(b); });
+        std::string line = "[heaptrack]";
+        char item[96];
+        for (size_t i = 0; i < growth.size() && i < 8; ++i)
+        {
+            std::snprintf(item, sizeof(item), " %08x:+%lldB/+%lld(%lldB)", std::get<2>(growth[i]),
+                          static_cast<long long>(std::get<0>(growth[i])), static_cast<long long>(std::get<1>(growth[i])),
+                          static_cast<long long>(std::get<3>(growth[i])));
+            line += item;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+        previous = std::move(current);
+    }
+
+    void freeWatch(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_live.erase(getRegU32(ctx, 4));
+        g_freeOrig(rdram, ctx, runtime);
+    }
+
+    void allocWatch(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t align = getRegU32(ctx, 4), size = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
+        uint32_t caller; // the operator new wrappers (0x22A710 ...) keep their $ra at their sp
+        std::memcpy(&caller, rdram + (getRegU32(ctx, 29) & 0x01FFFFFCu), 4);
+        g_allocOrig(rdram, ctx, runtime);
+        if (ctx->pc != ra)
+            return;
+        if (g_heapTrack && getRegU32(ctx, 2) != 0u && caller == 0x00340008u)
+        {
+            static int printed = 0;
+            if (printed < 6 && std::chrono::steady_clock::now() - g_appliedAt > std::chrono::seconds(170))
+            {
+                // Return addresses on the guest stack: words in the code range right after a jal/jalr.
+                std::string chain;
+                char b[12];
+                const uint32_t sp = getRegU32(ctx, 29);
+                int found = 0;
+                for (uint32_t a = sp; a < sp + 0x1000u && found < 30; a += 4)
+                {
+                    uint32_t w, ins;
+                    std::memcpy(&w, rdram + (a & 0x01FFFFFCu), 4);
+                    if (w < 0x00100008u || w >= 0x0043A000u || (w & 3u))
+                        continue;
+                    std::memcpy(&ins, rdram + w - 8u, 4);
+                    if ((ins >> 26) == 3u || ((ins >> 26) == 0u && (ins & 0x3Fu) == 9u))
+                    {
+                        std::snprintf(b, sizeof(b), " %08x", w);
+                        chain += b;
+                        ++found;
+                    }
+                }
+                std::fprintf(stderr, "[heaptrack] clone buffer %u bytes, stack:%s\n", size, chain.c_str());
+                ++printed;
+            }
+        }
+        if (g_heapTrack && getRegU32(ctx, 2) != 0u)
+        {
+            g_live[getRegU32(ctx, 2)] = {size, caller};
+            heapTrackReport();
+        }
+        if (getRegU32(ctx, 2) != 0u)
+            return;
+        auto rd = [rdram](uint32_t a) { uint32_t v; std::memcpy(&v, rdram + (a & 0x01FFFFFCu), 4); return v; };
+        uint32_t blocks = 0, total = 0, biggest = 0;
+        for (uint32_t b = rd(0x005ADD48u + 8u); b != 0x005ADD48u && b != 0u && blocks < 100000u; b = rd(b + 8u))
+        {
+            const uint32_t sz = rd(b);
+            ++blocks;
+            total += sz;
+            biggest = std::max(biggest, sz);
+        }
+        uint32_t used;
+        std::memcpy(&used, rdram + 0x004C14A4u, 4);
+        std::fprintf(stderr, "[heap] ALLOC FAILED size %u align %u ra %08x caller %08x: used %u, free list %u blocks %u bytes, biggest %u\n",
+                     size, align, ra, caller, used, blocks, total, biggest);
+    }
+
     void syncVHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (g_heapLog)
+            heapLog(rdram);
         if (g_targetHz > 0.0f)
             applyFrameRate(rdram);
         if (g_frameStats)
@@ -215,7 +368,13 @@ namespace
             g_stepCap = std::max(2.0f, std::round(2.0f * g_targetHz / 60.0f));
             runtime.replaceFunction(g_step.fn, &stepCount);
         }
-        if (g_frameStats || g_targetHz > 0.0f)
+        g_heapLog = !eu && std::getenv("CNR_HEAP_LOG") && std::getenv("CNR_HEAP_LOG")[0] == '1';
+        if (g_heapLog && (g_allocOrig = runtime.lookupFunction(0x00229E80u)))
+            runtime.replaceFunction(0x00229E80u, &allocWatch);
+        g_heapTrack = g_heapLog && std::getenv("CNR_HEAP_TRACK") && std::getenv("CNR_HEAP_TRACK")[0] == '1';
+        if (g_heapTrack && (g_freeOrig = runtime.lookupFunction(0x0022A358u)))
+            runtime.replaceFunction(0x0022A358u, &freeWatch);
+        if (g_frameStats || g_targetHz > 0.0f || g_heapLog)
         {
             const uint32_t syncV = eu ? 0x003B9DE0u : 0x003B9DF8u;
             g_syncVOrig = runtime.lookupFunction(syncV);
