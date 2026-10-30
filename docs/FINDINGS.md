@@ -2,7 +2,7 @@
 
 Reverse-engineering notes and the evidence behind each runtime change. Addresses are USA unless stated.
 
-## Status (2026-10-29, phase 2)
+## Status (2026-10-30)
 
 **Playable, USA and EU.** Cold boot -> movies -> memory card check -> title -> profile (new or loaded) -> menus ->
 races, both regions. Rendering through PCSX2's hardware GS (D3D11), audio through PCSX2's SPU2 (WASAPI), SDL3 pad.
@@ -14,7 +14,9 @@ races, both regions. Rendering through PCSX2's hardware GS (D3D11), audio throug
   garbage first output line/column (1-pixel presentation crop).
 * Glitch sweep: attract-mode demos on six tracks (USA + EU), menus, profile flow, a full lap on Rocky Mountain Trail:
   no rendering faults seen.
-* Frame rates above 60 (`CNR_FPS=90/120`): races start, run at full speed and no longer crash (see "Frame rates above 60").; world-anchored 2D markers
+* Everything is set in the TRG Launcher 2.0 (`launcher/project.cpp`, "The launcher" below).
+* Frame rates above 60 (`CNR_FPS`): races start, run at full speed and no longer crash at 90, 120, 144 and 165 (USA) and
+  60 and 120 (EU); 240 stays on the first Loading screen (see "Frame rates above 60"). World-anchored 2D markers
   sit slightly off in 16:9; a "WRONG WAY" sign was once captured without its text (not reproduced, may be its blink).
 
 ## IOP side (IOPMAIN.IRX, the game's own module)
@@ -191,10 +193,35 @@ world takes that step at race load (0x177ED4).
   Not investigated yet.
 * Debug: `CNR_HEAP_LOG=1` (USA) logs heap use/free once a second and every failed allocation with its caller;
   `CNR_HEAP_TRACK=1` adds live allocations by caller (leak hunting).
+* Races through the launcher's game folder, 1080p, 2026-10-30: USA 144 and 165 held their rate in the race. EU 50 (two
+  runs) and 60 reached a race; one earlier EU 60 run stayed on the pre-race Loading screen for two minutes, then stopped
+  on the frame a `CNR_SHOT_DIR` screenshot was taken. Not reproduced.
+* 240 Hz (USA): three of three runs stayed on the first Loading screen until the run ended, at a steady 240 frames/s, so
+  the launcher does not offer it. Not investigated (the EE cycle scale is 0.25 there). "No limit" is not offered either: it
+  would need a rate above that.
 * Debug aids from this: `CNR_RAMDUMP=<s>,<s>` (EE RAM to build/runs/ram_<s>.bin), scripts/xref.py (code that builds an
   address), scripts/vtable.py.
 * The runtime's automatic EE cycle scale (60 / vblank rate) is needed: with `PS2X_EE_CYCLE_SCALE=1` frames span
   several vblanks at 90 Hz.
+
+## The launcher
+
+`launcher/project.cpp` describes the game to the TRG Launcher 2.0: two games (USA, Europe), each with its own folder,
+`games/<id>`, its own program and its own `<id>.toml`. The launcher itself needed PlayStation 2 discs and sections written
+for a game that is not on ReXGlue (`patches/trg-launcher/0001-ps2-games.patch`).
+
+* Install: the disc's serial comes from SYSTEM.CNF. Only about 5 MB of the disc is read as files (the ELF, CDFILES.DAT,
+  MODULES/, SYSTEM.CNF); ARCHIVE.AR and the movies are read by sector. So the launcher keeps the image as
+  `game/disc.iso` (a hard link on the same drive) and copies files up to 16 MB beside it.
+* The launcher passes `--game_data_root=<dir>` and `--cnr_from_launcher=true`. `src/cnr_settings.cpp` reads
+  `<exe dir>/<exe name>.toml`; the launcher writes every default before the first Play, so the game sees what it shows.
+  Without the file the game uses its defaults and the `CNR_*` switches, which still win.
+* Resolution: the window (or a borderless fullscreen window over the screen) and the GS upscale, which is the smallest
+  multiple of 640 x 448 that covers the size both ways: 3x at 1080p, 4x at 1440p, 6x at 4K.
+* The games are window programs (`/SUBSYSTEM:WINDOWS`), so no console opens; from the launcher their output goes to
+  `logs/game.log` and `logs/game-errors.log`.
+* Vibration: `scePadSetActAlign` and `scePadSetActDirect` are hooked and passed to `SDL_RumbleGamepad`. Not yet felt on a
+  real controller.
 
 ## Memory card saves
 

@@ -5,12 +5,14 @@ Game files are user supplied; during development they live in `game files/` and 
 
 ## One-time setup
 
-1. Third-party sources (git-ignored for now; they become submodules before publishing):
+1. Third-party sources (git-ignored, fetched by hand):
    * `ext/PS2Recomp`: `git clone -b killzone --recursive https://github.com/drakolordx7/PS2Recomp.git ext/PS2Recomp`
      (verified at d042263), then `git -C ext/PS2Recomp apply ../../patches/ps2recomp/0001-cnr-runtime.patch`
    * `ext/pcsx2`: `git clone https://github.com/PCSX2/pcsx2.git ext/pcsx2`, then `git -C ext/pcsx2 checkout 646df006a4`
    * `ext/kzgs/deps`: PCSX2's `pcsx2-windows-dependencies.7z` (latest-windows-dependencies release), extracted there
    * `ext/sdl3`: `SDL3-devel-3.4.16-VC.zip`, extracted there
+   * `ext/trg-launcher`: `git clone https://github.com/TekRantGaming/trg-launcher.git ext/trg-launcher` (verified at
+     8896944), then `git -C ext/trg-launcher apply ../../patches/trg-launcher/0001-ps2-games.patch`
 2. Extract the boot files from the disc image: `SLUS_214.38`, `SYSTEM.CNF`, `CDFILES.DAT` and `MODULES/` into
    `extracted/usa/` (7-Zip can open the ISO).
 3. Ghidra function map (only needed when the map changes; the result is committed in `config/usa/`):
@@ -47,6 +49,21 @@ The EU executable is a second build of the same project against the EU code:
 cmd //c "scripts\vsenv.bat cmake -S . -B build\cnr_eu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCNR_GENERATED_DIR=generated/eu"
 cmd //c "scripts\vsenv.bat cmake --build build\cnr_eu -j 14"
 ```
+
+## The launcher
+
+Players start the game from the TRG Launcher 2.0. `launcher/project.cpp` holds everything about this game, including
+every setting. It is built on its own (it fetches SDL2, Dear ImGui and stb) and staged with both games:
+
+```bash
+cmd //c "scripts\vsenv.bat cmake -S launcher -B build\launcher -G Ninja -DCMAKE_BUILD_TYPE=Release"
+cmd //c "scripts\vsenv.bat cmake --build build\launcher"
+python scripts/stage_launcher.py
+```
+
+`dist/CartoonNetworkRacing/cnr_launcher.exe` is the portable result: `games/cnr_usa` and `games/cnr_eu` hold the programs,
+and the launcher's install step puts the player's disc in `game/` beside them. Saves stay in each game's `saves/` folder.
+Staging again replaces the programs and keeps the disc, settings, saves and shader cache.
 
 ## Run
 

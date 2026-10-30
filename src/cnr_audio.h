@@ -4,3 +4,5 @@
 // Before PS2Runtime::initialize. outputDevice=false emulates the SPU2 without opening a device (automated runs).
 // CNR_AUDIO=0 disables sound entirely.
 bool cnrAudioInstall(bool outputDevice);
+// 0..100 of the original level.
+void cnrAudioSetVolume(int percent);

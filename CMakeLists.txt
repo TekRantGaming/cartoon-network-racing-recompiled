@@ -65,6 +65,8 @@ target_precompile_headers(cnr PRIVATE
 )
 if(MSVC)
     target_compile_options(cnr PRIVATE /bigobj /FS)
+    # A window program that starts at main(): no console window when the launcher starts it. Output can still be redirected.
+    target_link_options(cnr PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
 endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(cnr) # FFmpeg DLLs for the runtime's MPEG HLE (FMVs)

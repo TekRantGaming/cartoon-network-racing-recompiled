@@ -79,7 +79,7 @@ namespace
         return s;
     }
 
-    KzgsConfig toKzgs(const CnrVideoConfig &c, int windowHeight)
+    KzgsConfig toKzgs(const CnrVideoConfig &c, int windowWidth, int windowHeight)
     {
         KzgsConfig k;
         switch (c.renderer)
@@ -88,9 +88,32 @@ namespace
         case CnrRenderer::D3D12: k.renderer = KzgsRenderer::D3D12; break;
         case CnrRenderer::Vulkan: k.renderer = KzgsRenderer::Vulkan; break;
         }
-        // Auto: smallest multiple of 448 lines that covers the window height.
-        k.upscale = c.upscale > 0 ? c.upscale : std::clamp((std::max(windowHeight, 448) + 447) / 448, 1, 8);
+        // Auto: the smallest multiple of the PS2's 640 x 448 picture that covers the resolution, both ways.
+        const int outW = c.outputWidth > 0 ? c.outputWidth : windowWidth;
+        const int outH = c.outputHeight > 0 ? c.outputHeight : windowHeight;
+        k.upscale = c.upscale > 0 ? c.upscale : std::clamp(std::max((outW + 639) / 640, (outH + 447) / 448), 1, 8);
         k.vsync = c.vsync;
+        k.fxaa = c.antiAliasing == CnrAntiAliasing::Fxaa;
+        k.smaa = c.antiAliasing == CnrAntiAliasing::Smaa;
+        k.edgeAA = c.edgeAA;
+        k.textureFiltering = static_cast<KzgsTextureFilter>(c.textureFilter);
+        k.trilinear = c.trilinear;
+        k.anisotropy = c.anisotropy;
+        k.mipmaps = c.mipmaps;
+        k.blendingAccuracy = c.blending;
+        k.dithering = c.dithering;
+        k.casSharpness = c.sharpening;
+        k.bilinearPresent = c.scaling != CnrPresentScaling::Nearest;
+        k.sharpPresent = c.scaling == CnrPresentScaling::Sharp;
+        k.tvShader = c.tvShader;
+        k.brightness = c.brightness;
+        k.contrast = c.contrast;
+        k.saturation = c.saturation;
+        k.gamma = c.gamma;
+        k.halfPixelOffset = c.halfPixelOffset;
+        k.nativeScaling = c.nativeScaling;
+        k.loadTextureReplacements = c.textureReplacements;
+        k.dumpTextures = c.dumpTextures;
         k.aspect = KzgsAspect::Ratio4_3; // wide frames: kzgsSetWideRatio
         // The output's first native line and column are garbage/black (hidden by overscan on a TV): crop one native
         // pixel on every side so the image stays centred.
@@ -139,8 +162,9 @@ namespace
     {
         std::vector<uint8_t> rgba;
         int w = 0, h = 0;
-        // As presented (aspect-corrected), 1280 wide: 16:9 frames 1280x720, 4:3 ones pillarboxed in it.
-        const int pw = s.cfg.widescreen ? 1280 : 0, ph = s.cfg.widescreen ? 720 : 0;
+        // As presented (aspect-corrected), at the launcher's resolution or 1280 x 720: 16:9 frames fill it, 4:3 ones are pillarboxed.
+        const int pw = !s.cfg.widescreen ? 0 : s.cfg.outputWidth > 0 ? s.cfg.outputWidth : 1280;
+        const int ph = !s.cfg.widescreen ? 0 : s.cfg.outputHeight > 0 ? s.cfg.outputHeight : 720;
         if (!kzgsReadback(rgba, w, h, pw, ph) || w <= 0 || h <= 0)
             return;
         for (size_t i = 3; i < rgba.size(); i += 4)
@@ -546,16 +570,17 @@ namespace
 
 bool cnrGsAttach(PS2Runtime &runtime, void *hwnd, int windowWidth, int windowHeight, const CnrVideoConfig &cfg, std::string *error)
 {
-    (void)windowWidth;
     GsState &s = gs();
     s.runtime = &runtime;
     s.cfg = cfg;
     kzgsSetLogCallback(&onLog);
     snapshotPrivRegs(s, s.privRegs);
-    const KzgsConfig kc = toKzgs(cfg, windowHeight);
+    const KzgsConfig kc = toKzgs(cfg, windowWidth, windowHeight);
+    kzgsSetGameSerial(cfg.serial);
     if (!kzgsOpen(hwnd, kc, s.privRegs, error))
         return false;
     kzgsSetWideRatio(cfg.widescreen ? 16.0f / 9.0f : 0.0f);
+    kzgsSetShowFps(cfg.showFps);
     runtime.gs().setRasterBackend(std::make_unique<SkipDrawBackend>());
     PS2HostGs hooks;
     hooks.gifPacket = &onGifPacket;

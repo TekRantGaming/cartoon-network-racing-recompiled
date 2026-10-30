@@ -261,6 +261,16 @@ namespace
 		o.DumpPaletteTextures = cfg.dumpTextures;
 		o.DumpTexturesWithFMVActive = cfg.dumpTextures;
 		o.HWAA1 = cfg.edgeAA;
+		o.HWMipmap = cfg.mipmaps;
+		o.TriFilter = static_cast<TriFiltering>(std::clamp(cfg.trilinear, -1, 2));
+		o.AccurateBlendingUnit = static_cast<AccBlendLevel>(std::clamp(cfg.blendingAccuracy, 0, static_cast<int>(AccBlendLevel::MaxCount) - 1));
+		o.Dithering = static_cast<u8>(std::clamp(cfg.dithering, 0, 3));
+		o.TVShader = static_cast<u8>(std::clamp(cfg.tvShader, 0, 7));
+		o.ShadeBoost = cfg.brightness != 50 || cfg.contrast != 50 || cfg.saturation != 50 || cfg.gamma != 50;
+		o.ShadeBoost_Brightness = static_cast<u8>(std::clamp(cfg.brightness, 0, 100));
+		o.ShadeBoost_Contrast = static_cast<u8>(std::clamp(cfg.contrast, 0, 100));
+		o.ShadeBoost_Saturation = static_cast<u8>(std::clamp(cfg.saturation, 0, 100));
+		o.ShadeBoost_Gamma = static_cast<u8>(std::clamp(cfg.gamma, 0, 100));
 		o.AspectRatio = ToAspect(cfg.aspect);
 		o.VsyncEnable = cfg.vsync;
 		o.LinearPresent = !cfg.bilinearPresent ? GSPostBilinearMode::Off

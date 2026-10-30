@@ -4,6 +4,7 @@
 //
 // Addresses are per ELF build (USA and EU are separate compiles), so each binding names both. 0 = not located yet.
 
+#include "cnr_input.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
@@ -269,6 +270,33 @@ namespace
         g_syncVOrig(rdram, ctx, runtime);
     }
 
+    // The motors. The game picks which of its 6 actuator bytes drives which motor with scePadSetActAlign (0 small, 1 large,
+    // 0xFF unused), then sets them with scePadSetActDirect; the runtime only reports two motors and ignores the rest.
+    PS2Runtime::RecompiledFunction g_actAlignOrig = nullptr, g_actDirectOrig = nullptr;
+    uint8_t g_actAlign[6] = {0, 1, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    void actAlignHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::memcpy(g_actAlign, rdram + (getRegU32(ctx, 6) & 0x01FFFFFFu), sizeof(g_actAlign));
+        g_actAlignOrig(rdram, ctx, runtime);
+    }
+
+    void actDirectHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint8_t *data = rdram + (getRegU32(ctx, 6) & 0x01FFFFFFu);
+        bool small = false;
+        uint8_t large = 0;
+        for (int i = 0; i < 6; ++i)
+        {
+            if (g_actAlign[i] == 0)
+                small = small || data[i] != 0;
+            else if (g_actAlign[i] == 1)
+                large = std::max(large, data[i]);
+        }
+        cnrInputSetRumble(small, large);
+        g_actDirectOrig(rdram, ctx, runtime);
+    }
+
     // 16:9 Hor+ (CNR_WIDESCREEN=0: off). The camera setup FUN_0033ecf8 (EU 0x33EC58) builds the projection from a
     // constant table K (USA 0x4C4C58, EU 0x4C4C68; = 1, 1, 4/3): x scale = K[1] / tan(fov / 2), y scale from K[0], K[2]
     // and the viewport. Nothing else reads K[1], so K[1] = 3/4 widens the horizontal view by 4/3 and keeps the vertical one.
@@ -355,6 +383,12 @@ namespace
                 continue;
             }
             runtime.replaceFunction(addr, b.fn);
+        }
+        const uint32_t actAlign = eu ? 0x003BACA8u : 0x003BACC0u, actDirect = eu ? 0x003BABE0u : 0x003BABF8u;
+        if ((g_actAlignOrig = runtime.lookupFunction(actAlign)) && (g_actDirectOrig = runtime.lookupFunction(actDirect)))
+        {
+            runtime.replaceFunction(actAlign, &actAlignHook);
+            runtime.replaceFunction(actDirect, &actDirectHook);
         }
         g_frameStats = std::getenv("CNR_FRAME_STATS") && std::getenv("CNR_FRAME_STATS")[0] == '1';
         if (const char *fps = std::getenv("CNR_FPS"); fps && std::atoi(fps) > 0)

@@ -62,6 +62,13 @@ struct KzgsConfig
 	bool loadTextureReplacements = false;
 	bool dumpTextures = false;
 	bool edgeAA = false;                               // GS AA1 (PS2 edge antialiasing emulation, "HWAA1")
+	bool mipmaps = true;                               // PCSX2 HWMipmap: the game's own mipmap levels (off: level 0 only)
+	int trilinear = -1;                                // PCSX2 TriFiltering: -1 Automatic, 0 Off, 1 PS2, 2 Forced
+	int blendingAccuracy = 1;                          // PCSX2 AccBlendLevel: 0 Minimum, 1 Basic ... 5 Maximum
+	int dithering = 2;                                 // PCSX2 Dithering: 0 Off, 1 Scaled, 2 Unscaled, 3 Force 32 bit
+	int tvShader = 0;                                  // PCSX2 TVShader: 0 None, 1 Scanline, 2 Diagonal, 3 Triangular, 4 Wave, 5 Lottes CRT, 6 4xRGSS, 7 NxAGSS
+	// PCSX2 Shade Boost; 50 is neutral. Applied when any of them differs from 50.
+	int brightness = 50, contrast = 50, saturation = 50, gamma = 50;
 	KzgsAspect aspect = KzgsAspect::Ratio4_3;
 	bool vsync = true;
 	bool bilinearPresent = true;                       // smooth scaling of the final image to the window
@@ -155,6 +162,9 @@ void kzgsSync();
 // With presentWidth/presentHeight > 0 the image is instead scaled and aspect-corrected the way it is presented in a
 // window of that size (letterboxed with black to exactly presentWidth x presentHeight).
 bool kzgsReadback(std::vector<uint8_t>& rgba, int& width, int& height, int presentWidth = 0, int presentHeight = 0);
+
+// The game's serial as PCSX2 writes it ("SLUS-21438"): the folder of texture replacements and dumps. Before kzgsOpen.
+void kzgsSetGameSerial(const char* serial);
 
 // Optional sink for GS log lines (device info, warnings, errors). Called from the GS thread. nullptr = OutputDebugString.
 using KzgsLogFn = void (*)(int level /*0 error, 1 warning, 2 info*/, const char* msg);

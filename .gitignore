@@ -9,6 +9,7 @@ SLES_*
 
 # Build output
 /build/
+/dist/
 /out/
 
 # Downloaded third-party tools
@@ -16,8 +17,9 @@ SLES_*
 /tools/src/
 /ghidra_projects/
 
-# Third-party trees (become submodules before publishing)
+# Third-party trees, fetched by hand with our patches on top (docs/BUILDING.md)
 /ext/PS2Recomp/
+/ext/trg-launcher/
 /ext/pcsx2/
 /ext/kzgs/deps/
 /ext/*/build/

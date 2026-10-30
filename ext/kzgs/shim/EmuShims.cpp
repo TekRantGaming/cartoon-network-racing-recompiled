@@ -87,7 +87,9 @@ const char* ReportInterlaceMode()
 
 // ---- VMManager ------------------------------------------------------------------------------------------------------
 bool VMManager::HasValidVM() { return true; }
-std::string VMManager::GetDiscSerial() { return "SCUS-97402"; }
+static std::string s_disc_serial = "SCUS-97402";
+void kzgsSetGameSerial(const char* serial) { s_disc_serial = serial; }
+std::string VMManager::GetDiscSerial() { return s_disc_serial; }
 std::string VMManager::GetTitle(bool prefer_en) { return "Killzone"; }
 u32 VMManager::GetDiscCRC() { return 0; }
 

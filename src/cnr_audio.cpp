@@ -23,6 +23,7 @@ namespace
     constexpr uint32_t kHighFrames = kRate * 150 / 1000;  // above this (producer ahead of real time): skip to target
 
     SDL_AudioStream *g_stream = nullptr;
+    float g_gain = 1.0f;
 
     // CNR_AUDIO_WAV=<file>: record the SPU2's mixed output (debug aid; the header is rewritten every second so the file
     // stays valid when the process is killed).
@@ -106,6 +107,7 @@ namespace
             std::cerr << "[cnr_audio] no audio device: " << SDL_GetError() << std::endl;
             return false;
         }
+        SDL_SetAudioStreamGain(g_stream, g_gain);
         SDL_ResumeAudioStreamDevice(g_stream);
         std::cout << "[cnr_audio] output: " << SDL_GetCurrentAudioDriver() << ", 48 kHz stereo" << std::endl;
         return true;
@@ -195,6 +197,13 @@ namespace
         if (level >= 1)
             std::cerr << "[kzspu2] " << msg << std::endl;
     }
+}
+
+void cnrAudioSetVolume(int percent)
+{
+    g_gain = static_cast<float>(percent) / 100.0f;
+    if (g_stream)
+        SDL_SetAudioStreamGain(g_stream, g_gain);
 }
 
 bool cnrAudioInstall(bool outputDevice)

@@ -1,0 +1,1112 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b4a0c52..7246479 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -66,6 +66,7 @@ add_library(trg_launcher STATIC
+   src/settings.cpp
+   src/platform.cpp
+   src/xbox360.cpp
++  src/ps2.cpp
+   src/download.cpp
+   src/shader_pack.cpp
+   src/game_helpers.cpp
+diff --git a/include/trg/ps2.h b/include/trg/ps2.h
+new file mode 100644
+index 0000000..94a0f8b
+--- /dev/null
++++ b/include/trg/ps2.h
+@@ -0,0 +1,21 @@
++// PlayStation 2 disc images (ISO 9660), for "install from your own disc" pages.
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++namespace trg {
++
++class Task;
++
++// The disc's serial from the BOOT2 line of its SYSTEM.CNF ("SLUS_214.38"), or "" when the file is not a PlayStation 2
++// disc image (.iso with 2048 byte sectors).
++std::string ReadPs2Serial(const std::string& utf8_image);
++
++// Copies the disc's files of at most `max_file_bytes` into `out_dir`, keeping its folders, on a Task, reporting progress
++// in bytes and honouring Cancel. Names lose the ";1" version ending. Larger files stay in the image: most PlayStation 2
++// games read those by sector. Returns "" on success, else an error message.
++std::string ExtractPs2Disc(Task& task, const std::string& utf8_image, const std::string& utf8_out_dir,
++                           uint64_t max_file_bytes);
++
++}  // namespace trg
+diff --git a/launcher2/README.md b/launcher2/README.md
+index 5ef7d4a..0ed6c7f 100644
+--- a/launcher2/README.md
++++ b/launcher2/README.md
+@@ -127,6 +127,22 @@ size of its window when windowed. The launcher writes it as `window_width`/`wind
+ text and in `game_side/shared/render_quality.cpp`. Set `features.output_resolution = false` for the two separate rows.
+ From Angry Birds: The Re-Hatched Collection.
+ 
++### Games that are not on ReXGlue
++
++The Display, Graphics, Controller, Keyboard and mouse and Audio sections are written for ReXGlue's settings. A game on
++another runtime lists its own in `GameInfo::settings`: sections of rows made with `ChoiceRow`, `ToggleRow`, `SliderRow`,
++`ResolutionRow`, `KeyRow`, `HeadingRow` and `ParagraphRow` (`.When(key, value)` shows a row only while another setting has
++that value). The launcher writes each value to `games/<id>/<id>.toml` and every default before the first Play, so the game
++reads what the launcher shows. Each section gets a Default settings button.
++
++A PlayStation 2 game sets `source = InstallSource::kPs2Disc`, `console = "PlayStation 2"`, `disc_serial` (from SYSTEM.CNF)
++and `installed_file`. Its image is kept as `games/<id>/game/disc.iso` (a hard link on the same drive, otherwise a copy)
++with the disc's files up to `disc_file_limit` beside it. `saves_folder` keeps saves inside `games/<id>`, where updates and
++Remove game leave them; `tag` puts a region on the game's tile. Set `features.achievements = false` for a game without
++achievements. An empty `repo` means no releases yet: updates are off and their sections are hidden.
++
++Cartoon Network Racing's `launcher/project.cpp` is a full example.
++
+ ### The copy's facts
+ 
+ The install page and the About section show the copy the port was made with: version, file name, size, SHA1, MD5,
+diff --git a/launcher2/include/trg/hub.h b/launcher2/include/trg/hub.h
+index 39fa649..7f4a322 100644
+--- a/launcher2/include/trg/hub.h
++++ b/launcher2/include/trg/hub.h
+@@ -7,13 +7,15 @@
+ // release names) and calls trg::hub::Run from main. Everything else (home
+ // screen, game pages, settings, installs from the player's disc image or
+ // Xbox Live Arcade package, updates, achievements, saves, Add to Steam,
+-// Discord, Other TRG Projects) comes from the launcher.
++// Discord, Other TRG Projects) comes from the launcher. Games that do not run
++// on ReXGlue describe their own settings (GameInfo::settings).
+ // See launcher2/README.md.
+ #pragma once
+ 
+ #include <cstddef>
+ #include <cstdint>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include <imgui.h>
+@@ -25,6 +27,109 @@ enum class InstallSource {
+   kDisc,     // an Xbox 360 disc image (.iso); its title ID is checked, then the disc is extracted
+   kPackage,  // an Xbox Live Arcade package (the file in Content/<profile>/<title ID>/000D0000), or a folder it was
+              // extracted to; the full game is always unlocked by the game's port, not here
++  kPs2Disc,  // a PlayStation 2 disc image (.iso); GameInfo::disc_serial is checked, then the image is kept in the game
++             // folder as disc.iso (linked when it is on the same drive) and its small files are copied beside it
++};
++
++// One row of a game's own settings (GameInfo::settings). Make them with the functions below. Each row's value is
++// written to the game's settings file, and every row's default too before the first Play, so the game reads what the
++// launcher shows.
++struct SettingOption {
++  const char* value;
++  const char* label;
++};
++
++struct SettingRow {
++  enum class Kind { kHeading, kParagraph, kChoice, kToggle, kSlider, kResolution, kKey };
++  Kind kind = Kind::kHeading;
++  const char* label = "";
++  const char* help = "";
++  const char* key = "";  // the setting's name in the game's settings file
++  const char* def = "";  // its default: an option's value, "true"/"false", a number, or the key names ("Z,Return")
++  std::vector<SettingOption> options;
++  int min = 0, max = 100, step = 1;
++  const char* format = "%d";
++  // Shown only while the setting `show_key` has the value `show_value` (the row's default is still written).
++  const char* show_key = nullptr;
++  const char* show_value = nullptr;
++
++  SettingRow When(const char* other_key, const char* value) const {
++    SettingRow r = *this;
++    r.show_key = other_key;
++    r.show_value = value;
++    return r;
++  }
++};
++
++inline SettingRow HeadingRow(const char* text) {
++  SettingRow r;
++  r.label = text;
++  return r;
++}
++inline SettingRow ParagraphRow(const char* text) {
++  SettingRow r;
++  r.kind = SettingRow::Kind::kParagraph;
++  r.label = text;
++  return r;
++}
++inline SettingRow ChoiceRow(const char* label, const char* help, const char* key, const char* def,
++                            std::vector<SettingOption> options) {
++  SettingRow r;
++  r.kind = SettingRow::Kind::kChoice;
++  r.label = label;
++  r.help = help;
++  r.key = key;
++  r.def = def;
++  r.options = std::move(options);
++  return r;
++}
++inline SettingRow ToggleRow(const char* label, const char* help, const char* key, bool def) {
++  SettingRow r;
++  r.kind = SettingRow::Kind::kToggle;
++  r.label = label;
++  r.help = help;
++  r.key = key;
++  r.def = def ? "true" : "false";
++  return r;
++}
++inline SettingRow SliderRow(const char* label, const char* help, const char* key, const char* def, int min, int max,
++                            int step, const char* format) {
++  SettingRow r;
++  r.kind = SettingRow::Kind::kSlider;
++  r.label = label;
++  r.help = help;
++  r.key = key;
++  r.def = def;
++  r.min = min;
++  r.max = max;
++  r.step = step;
++  r.format = format;
++  return r;
++}
++// Your screen, 1280 x 720 ... 3840 x 2160, 1920 x 1080 by default, written as window_width and window_height (0 for
++// Your screen): the size the game draws at and shows, and the size of its window when windowed.
++inline SettingRow ResolutionRow(const char* help) {
++  SettingRow r;
++  r.kind = SettingRow::Kind::kResolution;
++  r.label = "Resolution";
++  r.help = help;
++  return r;
++}
++// A key the player can change. `def` is one key name or several with commas; the names are ReXGlue's (Z, Return,
++// Left, Numpad0, LMB ...) plus LShift, RShift, LCtrl, RCtrl, LAlt and RAlt.
++inline SettingRow KeyRow(const char* label, const char* key, const char* def) {
++  SettingRow r;
++  r.kind = SettingRow::Kind::kKey;
++  r.label = label;
++  r.key = key;
++  r.def = def;
++  return r;
++}
++
++// A section of a game's own settings (Display, Graphics ...).
++struct SettingsSection {
++  const char* name;
++  std::vector<SettingRow> rows;
+ };
+ 
+ struct GameInfo {
+@@ -43,13 +148,13 @@ struct GameInfo {
+   const char* art_logo;    // transparent title logo
+   // The copy the port was made with, shown on the install page and the About section. Only the title ID is checked,
+   // so any good copy of the same game works.
+-  const char* copy_version;  // default.xex's version ("0.0.0.70")
++  const char* copy_version;  // default.xex's version ("0.0.0.70"), or SYSTEM.CNF's VER on a PlayStation 2 disc
+   const char* copy_name;     // the tested image or package's file name
+   const char* copy_size;     // "7,027,228,672 bytes"
+   const char* copy_sha1;
+   const char* copy_md5;
+   const char* copy_crc32;
+-  const char* media_id;      // the execution info's media ID
++  const char* media_id;      // the execution info's media ID ("" hides the row)
+   const char* installed_size;  // "about 1.6 GB"
+   // The game turns its camera with the mouse itself (its own mouse look hook): its Keyboard and mouse section shows
+   // <prefix>mouse_sensitivity and <prefix>mouse_invert_y instead of the runtime's mouse to stick sensitivity.
+@@ -58,6 +163,22 @@ struct GameInfo {
+   // for them, separated by commas ("720,1080"); nullptr: 720 only. Other sizes use the runtime's draw scale. (The
+   // game side must then keep the video mode the launcher writes; shared/render_quality.cpp sets 1280 x 720.)
+   const char* native_heights = nullptr;
++  // InstallSource::kPs2Disc: the serial in the disc's SYSTEM.CNF ("SLUS_214.38"). title_id is still a number of the
++  // project's own that tells its games apart (the serial's digits read well).
++  const char* disc_serial = nullptr;
++  // InstallSource::kPs2Disc: files of the disc up to this size are copied beside the image (the ones the game opens by
++  // name); the rest stay in the image, which the game reads by sector.
++  uint64_t disc_file_limit = 16u << 20;
++  // A file in the game's data folder (games/<id>/game) that shows the player's copy is installed.
++  const char* installed_file = "default.xex";
++  // Where the game keeps its saves: a folder inside games/<id>, kept when the game is removed or updated. nullptr: the
++  // user's Documents/<id>.
++  const char* saves_folder = nullptr;
++  // "USA", "Europe": for a project with one game in several regions. Shown on the game's tile and in its status line.
++  const char* tag = nullptr;
++  // The game's own settings. Not empty: these sections replace Display, Graphics, Controller, Keyboard and mouse and
++  // Audio, which are written for ReXGlue's runtime.
++  std::vector<SettingsSection> settings;
+ };
+ 
+ // A tile on the Other TRG Projects page. Art links are full URLs (usually SteamGridDB); "" draws a plain card.
+@@ -84,6 +205,7 @@ struct Features {
+   // video mode for GameInfo::native_heights, the draw scale for the rest) and the window's size. The upscaler modes
+   // scale from it too (game_side/shared/render_quality.cpp). Off: the two separate rows.
+   bool output_resolution = true;
++  bool achievements = true;  // the Achievements section and card (the game has achievements to show)
+ };
+ 
+ struct ProjectConfig {
+@@ -102,7 +224,8 @@ struct ProjectConfig {
+ 
+   std::vector<GameInfo> games;
+ 
+-  // Releases (docs: two releases per version, see launcher2/README.md).
++  // Releases (docs: two releases per version, see launcher2/README.md). An empty repo means no releases yet: nothing
++  // is checked or downloaded, the Updates sections are hidden and the game's files must already be in games/<id>.
+   std::string repo;                               // "TekRantGaming/whopping-recompilation-collection"
+   std::string packages_tag_prefix = "packages-v";  // the release the launcher downloads from
+   std::string launcher_zip;   // "WhoppingCollection": its update is <zip>-<version>-windows-x64.zip (Windows) or
+diff --git a/launcher2/src/app.cpp b/launcher2/src/app.cpp
+index 7387900..d22ea9a 100644
+--- a/launcher2/src/app.cpp
++++ b/launcher2/src/app.cpp
+@@ -120,13 +120,14 @@ void App::Start() {
+     // Updates install by themselves ("update them automatically when a new
+     // version has been released"); the launcher checks once at startup.
+ #if defined(_WIN32)  // on Linux the games come inside the launcher's AppImage and update with it
+-    if (launcher_settings_->GetBool("auto_update", true)) {
++    if (!Project().repo.empty() && launcher_settings_->GetBool("auto_update", true)) {
+       for (int i = 0; i < GameCount(); ++i) {
+         if (states_[i] != GameState::kNotDownloaded) StartDownload(Games()[i], games_[i]->jobs, true);
+       }
+     }
+ #endif
+-    if (launcher_settings_->GetBool("update_check", true)) trg::StartUpdateCheck(self_updates_, self_updater_, "stable");
++    if (!Project().repo.empty() && launcher_settings_->GetBool("update_check", true))
++      trg::StartUpdateCheck(self_updates_, self_updater_, "stable");
+   } else {
+     g_art_downloads_allowed = false;
+     art_->Start();  // still loads what is cached; downloads are skipped while offline
+@@ -205,7 +206,7 @@ void App::OpenGameSettings(int game, const char* section) {
+   gu.achievements.loaded = false;  // read again: the game may have unlocked some since
+   gu.settings_view.in_rows = false;
+   if (section) {
+-    const int s = FindGameSection(section);
++    const int s = FindGameSection(*this, game, section);
+     if (s >= 0) {
+       gu.settings_view.section = s;
+       gu.settings_view.in_rows = true;
+@@ -245,6 +246,7 @@ void App::PrimaryAction(int game) {
+   }
+   switch (states_[game]) {
+     case GameState::kNotDownloaded:
++      if (Project().repo.empty()) SetToast(std::string("The program files of ") + Games()[game].title + " are missing.", true);
+       StartDownload(Games()[game], games_[game]->jobs);
+       break;
+     case GameState::kDownloaded:
+@@ -328,7 +330,10 @@ bool App::LaunchGame(int game) {
+   // Testing (--test-play): never the player's own saves in Documents, a private folder instead.
+   if (options_.test_play >= 0) args.push_back("--user_data_root=" + LauncherDir() + "/test-userdata");
+   // Features::output_resolution: the default size is written before the first Play, so the game gets it too.
+-  if (Project().features.output_resolution) SetOutput(*games_[game]->settings, g, 1920, 1080, true);
++  if (!g.settings.empty())
++    WriteSettingDefaults(*games_[game]->settings, g);
++  else if (Project().features.output_resolution)
++    SetOutput(*games_[game]->settings, g, 1920, 1080, true);
+   return Launch(GameExePath(g), GameDir(g), args, g.title, game);
+ }
+ 
+@@ -457,7 +462,7 @@ void App::PollSelfUpdate() {
+       if (up.report.installed) up.check.found.reset();
+     }
+   }
+-  if (!launcher_settings_->GetBool("update_check", true)) return;
++  if (Project().repo.empty() || !launcher_settings_->GetBool("update_check", true)) return;
+   if (!self_update_tried_ && !up.task.running() && trg::UpdateWaiting(up)) {
+     self_update_tried_ = true;
+     const trg::Release rel = *up.check.found;
+diff --git a/launcher2/src/app.h b/launcher2/src/app.h
+index 587f7cd..6898f73 100644
+--- a/launcher2/src/app.h
++++ b/launcher2/src/app.h
+@@ -183,7 +183,7 @@ void DrawProjects(App& app);  // projects_screen.cpp
+ void DrawHub(App& app, int game);
+ void FocusHubPlay();
+ void DrawGameSettings(App& app, int game);
+-int FindGameSection(const char* name);  // -1 when there is no such section
++int FindGameSection(App& app, int game, const char* name);  // -1 when there is no such section
+ void DrawInstall(App& app, int game);
+ void DrawCollection(App& app);
+ 
+diff --git a/launcher2/src/disc_finder.cpp b/launcher2/src/disc_finder.cpp
+index afef722..0bc9a53 100644
+--- a/launcher2/src/disc_finder.cpp
++++ b/launcher2/src/disc_finder.cpp
+@@ -4,6 +4,7 @@
+ #include <cctype>
+ #include <filesystem>
+ 
++#include <trg/ps2.h>
+ #include <trg/xbox360.h>
+ 
+ #include "games.h"
+@@ -110,8 +111,10 @@ void DiscFinder::Run() {
+       if (std::find(seen.begin(), seen.end(), path) != seen.end()) continue;
+       seen.push_back(path);
+       const uint32_t id = trg::ReadXbox360TitleId(path);
++      const std::string serial = trg::ReadPs2Serial(path);
+       for (const GameInfo& g : Games()) {
+-        if (g.title_id == id) found.push_back({path, id, static_cast<long long>(e.file_size(ec2))});
++        const bool match = g.source == InstallSource::kPs2Disc ? g.disc_serial && serial == g.disc_serial : g.title_id == id;
++        if (match) found.push_back({path, g.title_id, static_cast<long long>(e.file_size(ec2))});
+       }
+       std::lock_guard<std::mutex> lock(mu_);
+       found_ = found;
+diff --git a/launcher2/src/disc_finder.h b/launcher2/src/disc_finder.h
+index c3e56f1..96607ca 100644
+--- a/launcher2/src/disc_finder.h
++++ b/launcher2/src/disc_finder.h
+@@ -2,7 +2,7 @@
+ // buttons: the Windows file dialog cannot be used with a controller. Looks
+ // through the usual folders (Desktop, Downloads, Documents, Videos) and every
+ // fixed drive a few folders deep for .iso files, and keeps those whose title
+-// ID is one of the collection's games.
++// ID (or PlayStation 2 serial) is one of the collection's games.
+ #pragma once
+ 
+ #include <atomic>
+diff --git a/launcher2/src/games.cpp b/launcher2/src/games.cpp
+index 7259576..fda8683 100644
+--- a/launcher2/src/games.cpp
++++ b/launcher2/src/games.cpp
+@@ -120,6 +120,25 @@ void SetOutput(trg::SettingsStore& st, const GameInfo& game, int width, int heig
+   st.Save();
+ }
+ 
++void WriteSettingDefaults(trg::SettingsStore& st, const GameInfo& game) {
++  bool changed = false;
++  for (const SettingsSection& section : game.settings) {
++    for (const SettingRow& row : section.rows) {
++      if (row.kind == SettingRow::Kind::kResolution) {
++        if (st.Get("window_height").empty()) {
++          st.SetInt("window_width", 1920);
++          st.SetInt("window_height", 1080);
++          changed = true;
++        }
++      } else if (*row.key && st.Get(row.key).empty()) {
++        st.Set(row.key, row.def);
++        changed = true;
++      }
++    }
++  }
++  if (changed) st.Save();
++}
++
+ std::string GameDir(const GameInfo& game) { return LauncherDir() + "/games/" + game.id; }
+ std::string GameDataDir(const GameInfo& game) { return GameDir(game) + "/game"; }
+ #if defined(_WIN32)
+@@ -139,6 +158,7 @@ std::string BackupsDir(const GameInfo& game) { return LauncherDir() + "/save-bac
+ std::string CacheDir() { return LauncherDir() + "/cache"; }
+ 
+ std::string SavesDir(const GameInfo& game) {
++  if (game.saves_folder) return GameDir(game) + "/" + game.saves_folder;
+ #if defined(_WIN32)
+   PWSTR docs = nullptr;
+   std::string out;
+@@ -155,7 +175,7 @@ std::string SavesDir(const GameInfo& game) {
+ GameState DetectState(const GameInfo& game) {
+   std::error_code ec;
+   if (!fs::exists(PathOf(GameExePath(game)), ec)) return GameState::kNotDownloaded;
+-  if (!fs::exists(PathOf(GameDataDir(game) + "/default.xex"), ec)) return GameState::kDownloaded;
++  if (!fs::exists(PathOf(GameDataDir(game) + "/" + game.installed_file), ec)) return GameState::kDownloaded;
+   return GameState::kInstalled;
+ }
+ 
+diff --git a/launcher2/src/games.h b/launcher2/src/games.h
+index 1e8f2d8..e2e52d7 100644
+--- a/launcher2/src/games.h
++++ b/launcher2/src/games.h
+@@ -24,11 +24,16 @@ enum class GameState {
+ const std::vector<GameInfo>& Games();  // Project().games
+ int GameCount();
+ 
++// The game installs from a disc image of either console.
++inline bool IsDisc(const GameInfo& game) { return game.source != InstallSource::kPackage; }
++
+ // Folders (UTF-8, forward slashes). Everything lives beside the launcher, so the
+ // collection can be moved or deleted as one folder; saves stay where the games
+ // keep them (Documents/<id>).
+ std::string ProgramDir();   // the launcher's own folder (inside the AppImage on Linux)
+ std::string LauncherDir();  // where it writes: its folder on Windows, XDG_DATA_HOME/<linux_data_folder> on Linux
++// GameInfo::settings: writes each row's default that is not set yet, so the game reads what the launcher shows.
++void WriteSettingDefaults(trg::SettingsStore& st, const GameInfo& game);
+ // Features::output_resolution: writes the window size and the game's video mode and draw scale for a picture
+ // width x height (0 x 0: the screen's size), or, with `only_if_missing`, the default 1920 x 1080 when none is set yet.
+ void SetOutput(trg::SettingsStore& st, const GameInfo& game, int width, int height, bool only_if_missing = false);
+@@ -36,7 +41,7 @@ std::string GameDir(const GameInfo& game);       // games/<id>: the program file
+ std::string GameDataDir(const GameInfo& game);   // games/<id>/game: the files from the player's copy
+ std::string GameExePath(const GameInfo& game);
+ std::string GameSettingsPath(const GameInfo& game);  // games/<id>/<id>.toml, read by the game at start
+-std::string SavesDir(const GameInfo& game);      // Documents/<id>
++std::string SavesDir(const GameInfo& game);      // Documents/<id>, or GameInfo::saves_folder inside games/<id>
+ std::string BackupsDir(const GameInfo& game);    // save-backups/<id>
+ std::string CacheDir();                          // cache (art)
+ 
+diff --git a/launcher2/src/home.cpp b/launcher2/src/home.cpp
+index 15acc9f..f8875a4 100644
+--- a/launcher2/src/home.cpp
++++ b/launcher2/src/home.cpp
+@@ -75,7 +75,7 @@ std::string Badge(App& app, int i) {
+   switch (app.state(i)) {
+     case GameState::kNotDownloaded: return "Not installed";
+     case GameState::kDownloaded:
+-      return Games()[i].source == InstallSource::kDisc ? "Needs your disc" : "Needs your copy";
++      return IsDisc(Games()[i]) ? "Needs your disc" : "Needs your copy";
+     default: return "";
+   }
+ }
+@@ -92,6 +92,12 @@ void DrawTile(App& app, int i, ImVec2 a, ImVec2 b, bool focused) {
+     dl->AddRectFilled(a, b, Accent(Games()[i].accent, 0.8f), 8 * f.s);
+     Text(f.bold, 20, ImVec2(a.x + 12 * f.s, a.y + 14 * f.s), White(), Games()[i].title, (b.x - a.x) / f.s - 24);
+   }
++  if (const char* tag = Games()[i].tag) {
++    const ImVec2 t = TextSize(f.semibold, 12, tag);
++    const ImVec2 ta(b.x - 8 * f.s - t.x - 14 * f.s, a.y + 8 * f.s), tb(b.x - 8 * f.s, ta.y + t.y + 6 * f.s);
++    dl->AddRectFilled(ta, tb, Black(0.75f), 4 * f.s);
++    Text(f.semibold, 12, ImVec2(ta.x + 7 * f.s, ta.y + 3 * f.s), White(), tag);
++  }
+   const std::string badge = Badge(app, i);
+   if (!badge.empty()) {
+     const ImVec2 t = TextSize(f.semibold, 12, badge);
+@@ -268,7 +274,7 @@ void DrawHome(App& app) {
+       case GameState::kNotDownloaded: line = "Not on this PC yet"; break;
+       case GameState::kDownloaded:
+         line = std::string("Ready") + kBullet + "Play asks for your " +
+-               (game.source == InstallSource::kDisc ? "disc image" : "copy of the game") + " the first time";
++               (IsDisc(game) ? "disc image" : "copy of the game") + " the first time";
+         break;
+       case GameState::kInstalled: {
+         line = app.running_game() == g ? "Playing now" : "Ready to play";
+@@ -280,6 +286,7 @@ void DrawHome(App& app) {
+         break;
+       }
+     }
++    if (game.tag) line = std::string(game.tag) + kBullet + line;
+     Text(f.regular, 16, ImVec2(f.X(48), y), White(0.72f), line);
+   }
+ 
+diff --git a/launcher2/src/hub.cpp b/launcher2/src/hub.cpp
+index 31091b0..dfa4e62 100644
+--- a/launcher2/src/hub.cpp
++++ b/launcher2/src/hub.cpp
+@@ -79,9 +79,11 @@ void NewsCard(App& app, int g, ImVec2 a, ImVec2 b) {
+   f.dl->AddRectFilledMultiColor(ImVec2(a.x, a.y + (b.y - a.y) * 0.3f), b, Black(0.0f), Black(0.0f), Black(0.88f),
+                                 Black(0.88f));
+   const std::string v = InstalledVersion(Games()[g]);
+-  Text(f.regular, 13, ImVec2(a.x + 18 * f.s, b.y - 66 * f.s), White(0.7f), "What's new");
++  const bool no_releases = Project().repo.empty();
++  Text(f.regular, 13, ImVec2(a.x + 18 * f.s, b.y - 66 * f.s), White(0.7f), no_releases ? "About" : "What's new");
+   Text(f.semibold, 17, ImVec2(a.x + 18 * f.s, b.y - 46 * f.s), White(),
+-       v.empty() ? std::string("Release notes") : "Version " + v + " release notes");
++       no_releases ? std::string("This game and your copy")
++                   : v.empty() ? std::string("Release notes") : "Version " + v + " release notes");
+ }
+ 
+ void SavesCard(App& app, int g, ImVec2 a, ImVec2 b) {
+@@ -117,7 +119,11 @@ void DrawHub(App& app, int g) {
+   if (Pressed(Btn::kUp)) hub.row = 0;
+   if (Pressed(Btn::kDown)) hub.row = 1;
+   if (Pressed(Btn::kLeft)) hub.col = std::max(0, hub.col - 1);
+-  if (Pressed(Btn::kRight)) hub.col = std::min(2, hub.col + 1);
++  // The cards under the buttons: the Achievements card only for games that have them.
++  const bool ach_card = Project().features.achievements;
++  const int cards = ach_card ? 3 : 2, first_card = ach_card ? 0 : 1;
++  if (Pressed(Btn::kRight)) hub.col = std::min(hub.row == 0 ? 2 : cards - 1, hub.col + 1);
++  if (hub.row == 1) hub.col = std::min(hub.col, cards - 1);
+   if (Pressed(Btn::kX) && gu.jobs.task.running() && gu.jobs.kind != GameJobs::Kind::kInstall) gu.jobs.task.Cancel();
+ 
+   f.dl->AddRectFilled(f.o, f.end, IM_COL32(8, 8, 10, 255));
+@@ -169,8 +175,7 @@ void DrawHub(App& app, int g) {
+       case GameState::kNotDownloaded: line = "Not on this PC yet. Download gets the newest version."; break;
+       case GameState::kDownloaded:
+         line = (v.empty() ? std::string("Ready") : "Version " + v) + kBullet +
+-               "Play asks for your " + (game.source == InstallSource::kDisc ? "disc image" : "copy of the game") +
+-               " the first time";
++               "Play asks for your " + (IsDisc(game) ? "disc image" : "copy of the game") + " the first time";
+         break;
+       case GameState::kInstalled:
+         line = "Installed" + (v.empty() ? std::string() : kBullet + ("Version " + v));
+@@ -182,18 +187,19 @@ void DrawHub(App& app, int g) {
+ 
+   // Cards.
+   const float top = f.B(78 + 190), bottom = f.B(78);
+-  const float total = f.size.x - 96 * f.s - 28 * f.s;
+-  const float w0 = total * 1.1f / 3.1f, w1 = total / 3.1f;
+-  const ImVec2 ca[3] = {ImVec2(f.X(48), top), ImVec2(f.X(48) + w0 + 14 * f.s, top),
+-                        ImVec2(f.X(48) + w0 + w1 + 28 * f.s, top)};
++  const float total = f.size.x - 96 * f.s - (cards - 1) * 14 * f.s;
++  const float w0 = ach_card ? total * 1.1f / 3.1f : 0.0f, w1 = ach_card ? total / 3.1f : total * 0.5f;
++  const float gap0 = ach_card ? 14 * f.s : 0.0f;
++  const ImVec2 ca[3] = {ImVec2(f.X(48), top), ImVec2(f.X(48) + w0 + gap0, top),
++                        ImVec2(f.X(48) + w0 + gap0 + w1 + 14 * f.s, top)};
+   const ImVec2 cb[3] = {ImVec2(ca[0].x + w0, bottom), ImVec2(ca[1].x + w1, bottom), ImVec2(ca[2].x + w1, bottom)};
+-  AchievementsCard(app, g, ca[0], cb[0]);
++  if (ach_card) AchievementsCard(app, g, ca[0], cb[0]);
+   NewsCard(app, g, ca[1], cb[1]);
+   SavesCard(app, g, ca[2], cb[2]);
+-  for (int i = 0; i < 3; ++i) {
+-    if (hub.row == 1 && hub.col == i) FocusRing(ca[i], cb[i], 10);
+-    if (Hover(ca[i], cb[i])) hovered = 3 + i;
+-    if (Clicked(ca[i], cb[i])) clicked = 3 + i;
++  for (int i = first_card; i < 3; ++i) {
++    if (hub.row == 1 && hub.col == i - first_card) FocusRing(ca[i], cb[i], 10);
++    if (Hover(ca[i], cb[i])) hovered = 3 + i - first_card;
++    if (Clicked(ca[i], cb[i])) clicked = 3 + i - first_card;
+   }
+   if (hovered >= 0 && MouseMoved() && hub.row * 3 + hub.col != hovered) {
+     hub.row = hovered / 3;
+@@ -204,12 +210,16 @@ void DrawHub(App& app, int g) {
+   int act = clicked;
+   if (Pressed(Btn::kA)) act = hub.row * 3 + hub.col;
+   if (Pressed(Btn::kStart)) act = 0;
++  if (act >= 3) act += first_card;  // the cards count from the Achievements card, shown or not
+   switch (act) {
+     case 0: app.PrimaryAction(g); break;
+     case 1: app.OpenGameSettings(g); break;
+     case 2: app.OpenGameSettings(g, "Saves and install"); break;
+     case 3: app.OpenGameSettings(g, "Achievements"); break;
+-    case 4: trg::OpenUrl(std::string("https://github.com/") + Project().repo + "/releases"); break;
++    case 4:
++      if (Project().repo.empty()) app.OpenGameSettings(g, "About");
++      else trg::OpenUrl(std::string("https://github.com/") + Project().repo + "/releases");
++      break;
+     case 5: app.OpenGameSettings(g, "Saves and install"); break;
+     default: break;
+   }
+diff --git a/launcher2/src/install.cpp b/launcher2/src/install.cpp
+index 320e49b..54ef69d 100644
+--- a/launcher2/src/install.cpp
++++ b/launcher2/src/install.cpp
+@@ -3,6 +3,7 @@
+ #include <cstdio>
+ #include <filesystem>
+ 
++#include <trg/ps2.h>
+ #include <trg/xbox360.h>
+ 
+ #include "package.h"
+@@ -25,6 +26,7 @@ trg::UpdaterConfig GameUpdaterConfig(const GameInfo& game) {
+   // Never written or deleted by an update: the game files from the player's copy, the settings the
+   // launcher keeps for the game, logs and crash reports.
+   c.protected_paths = {"game", std::string(game.id) + ".toml", "logs", "fpe.log"};
++  if (game.saves_folder) c.protected_paths.push_back(game.saves_folder);
+   c.work_dir = LauncherDir() + "/cache/downloads/" + game.id;
+   c.state_file = GameDir(game) + "/update-state.txt";
+   return c;
+@@ -44,12 +46,14 @@ std::string DescribeTitleId(uint32_t title_id, InstallSource source) {
+ void StartInstall(const GameInfo& game, const std::string& path, GameJobs& jobs) {
+   if (game.source == InstallSource::kPackage)
+     StartPackageInstall(game, path, jobs);
++  else if (game.source == InstallSource::kPs2Disc)
++    StartPs2DiscInstall(game, path, jobs);
+   else
+     StartDiscInstall(game, path, jobs);
+ }
+ 
+ void StartDownload(const GameInfo& game, GameJobs& jobs, bool quiet) {
+-  if (jobs.task.running()) return;
++  if (jobs.task.running() || Project().repo.empty()) return;
+ #if !defined(_WIN32)
+   // On Linux the games come inside the launcher's AppImage: they update when the launcher does.
+   (void)game;
+@@ -125,6 +129,60 @@ void StartDiscInstall(const GameInfo& game, const std::string& image, GameJobs&
+   });
+ }
+ 
++void StartPs2DiscInstall(const GameInfo& game, const std::string& image, GameJobs& jobs) {
++  if (jobs.task.running()) return;
++  jobs.kind = GameJobs::Kind::kInstall;
++  jobs.message.clear();
++  jobs.message_is_error = false;
++  const std::string out_dir = GameDataDir(game);
++  const std::string want = game.disc_serial;
++  const std::string title = game.title;
++  const std::string marker = game.installed_file;
++  const uint64_t limit = game.disc_file_limit;
++  jobs.task.Start("Checking the disc image", [image, out_dir, want, title, marker, limit](trg::Task& task) -> std::string {
++    const std::string got = trg::ReadPs2Serial(image);
++    if (got.empty())
++      return "That file is not a PlayStation 2 disc image. Choose the .iso file you made from your " + title + " disc.";
++    if (got != want) {
++      for (const GameInfo& other : Games())
++        if (other.disc_serial && got == other.disc_serial)
++          return "That is the disc of " + std::string(other.title) + ", not " + title + ". Choose the " + title +
++                 " disc image.";
++      return "That is a PlayStation 2 disc of another game (" + got + "), not " + title + ". Choose the " + title +
++             " disc image.";
++    }
++    const std::string staging = out_dir + ".part";
++    std::error_code ec;
++    fs::remove_all(fs::u8path(staging), ec);
++    fs::create_directories(fs::u8path(staging), ec);
++    task.SetLabel("Copying the game's files from your disc image");
++    std::string err = trg::ExtractPs2Disc(task, image, staging, limit);
++    if (!err.empty() || task.cancelled()) {
++      fs::remove_all(fs::u8path(staging), ec);
++      return err;
++    }
++    if (!fs::exists(fs::u8path(staging + "/" + marker), ec)) {
++      fs::remove_all(fs::u8path(staging), ec);
++      return "The disc image was read, but " + marker + " was not on it. The image may be damaged.";
++    }
++    // The game reads most of the disc by sector, so it keeps the whole image. On the same drive a link does that
++    // without a second copy, and the image stays when the original is moved or deleted.
++    fs::create_hard_link(fs::u8path(image), fs::u8path(staging + "/disc.iso"), ec);
++    if (ec) {
++      task.SetLabel("Copying your disc image. This takes a few minutes.");
++      err = trg::CopyFileJob(task, image, staging + "/disc.iso");
++      if (!err.empty() || task.cancelled()) {
++        fs::remove_all(fs::u8path(staging), ec);
++        return err;
++      }
++    }
++    fs::remove_all(fs::u8path(out_dir), ec);
++    fs::rename(fs::u8path(staging), fs::u8path(out_dir), ec);
++    if (ec) return "The files were copied, but the game folder could not be finished: " + ec.message();
++    return std::string();
++  });
++}
++
+ // From Trials: The Recompilation Collection (Xbox Live Arcade games).
+ void StartPackageInstall(const GameInfo& game, const std::string& path, GameJobs& jobs) {
+   if (jobs.task.running()) return;
+diff --git a/launcher2/src/install.h b/launcher2/src/install.h
+index e2064dc..a77f727 100644
+--- a/launcher2/src/install.h
++++ b/launcher2/src/install.h
+@@ -44,6 +44,7 @@ void StartUpdateCheck(const GameInfo& game, GameJobs& jobs);
+ // or a package, as the game's InstallSource says.
+ void StartInstall(const GameInfo& game, const std::string& path, GameJobs& jobs);
+ void StartDiscInstall(const GameInfo& game, const std::string& image, GameJobs& jobs);
++void StartPs2DiscInstall(const GameInfo& game, const std::string& image, GameJobs& jobs);
+ void StartPackageInstall(const GameInfo& game, const std::string& path, GameJobs& jobs);
+ // Call each frame: collects a finished job's result into jobs.message.
+ // Returns true on the frame a job finished.
+diff --git a/launcher2/src/install_screen.cpp b/launcher2/src/install_screen.cpp
+index 7047d97..a7602a6 100644
+--- a/launcher2/src/install_screen.cpp
++++ b/launcher2/src/install_screen.cpp
+@@ -207,7 +207,8 @@ void PickerToFront() {
+ void CopyCard(const GameInfo& game, ImVec2 a, float w) {
+   const Frame& f = F();
+   const ProjectConfig& p = Project();
+-  const bool disc = game.source == InstallSource::kDisc;
++  const bool disc = IsDisc(game);
++  const bool ps2 = game.source == InstallSource::kPs2Disc;
+   char id[16];
+   std::snprintf(id, sizeof id, "%08X", game.title_id);
+   // Everything known about the copy the port was made with. Only the title ID is checked, so another good copy of
+@@ -215,10 +216,11 @@ void CopyCard(const GameInfo& game, ImVec2 a, float w) {
+   std::vector<std::pair<const char*, std::string>> lines = {{"Game", game.title}};
+   if (!p.made_by.empty()) lines.push_back({"Made by", p.made_by});
+   if (!p.console.empty()) lines.push_back({"Console", disc ? p.console : p.console + " (Xbox Live Arcade)"});
+-  if (!p.region.empty()) lines.push_back({"Region", p.region});
++  const std::string region = game.tag ? game.tag : p.region;
++  if (!region.empty()) lines.push_back({"Region", region});
++  lines.push_back({ps2 ? "Disc ID" : "Title ID", ps2 ? game.disc_serial : id});
++  if (*game.media_id) lines.push_back({"Media ID", game.media_id});
+   lines.insert(lines.end(), {
+-      {"Title ID", id},
+-      {"Media ID", game.media_id},
+       {disc ? "Disc version" : "Game version", game.copy_version},
+       {disc ? "Tested image" : "Tested package", game.copy_name},
+       {disc ? "Image size" : "Package size", game.copy_size},
+@@ -240,8 +242,10 @@ void CopyCard(const GameInfo& game, ImVec2 a, float w) {
+     y += line_h;
+   }
+   Text(f.regular, 12, ImVec2(a.x + 20 * f.s, y + 8 * f.s), White(0.5f),
+-       disc ? std::string("Make the image (.iso) from your own disc. Other versions and regions will not work; another "
+-                          "good dump of this disc does, as only the title ID is checked.")
++       ps2 ? std::string("Make the image (.iso) from your own disc. Other regions will not work; another good dump of "
++                         "this disc does, as only the disc ID is checked.")
++       : disc ? std::string("Make the image (.iso) from your own disc. Other versions and regions will not work; another "
++                            "good dump of this disc does, as only the title ID is checked.")
+             : "Copy the package from your own console or its storage: it is the one file in Content\\0000000000000000\\" +
+                   std::string(id) + "\\000D0000. A folder it was extracted to works too. The full game is always unlocked.",
+        w / f.s - 40);
+@@ -339,9 +343,9 @@ void DrawInstall(App& app, int g) {
+     } else if (game.source == InstallSource::kPackage) {
+       PackageRows(app, g, r);
+     } else {
+-      r.Paragraph("This recompilation plays the original Xbox 360 game, so it needs a disc image (.iso) that you made "
+-                  "from your own " + std::string(game.title) + " disc. The game's files are copied from it. Nothing "
+-                  "from the game comes with the launcher.");
++      r.Paragraph("This recompilation plays the original " + Project().console + " game, so it needs a disc image "
++                  "(.iso) that you made from your own " + std::string(game.title) + " disc. The game's files are copied "
++                  "from it. Nothing from the game comes with the launcher.");
+       if (u.jobs.message_is_error && !u.jobs.message.empty()) r.Paragraph(u.jobs.message, false);
+       app.discs().Start();
+       for (const FoundDisc& d : app.discs().Found(game.title_id)) {
+diff --git a/launcher2/src/saves.cpp b/launcher2/src/saves.cpp
+index 377546e..f151138 100644
+--- a/launcher2/src/saves.cpp
++++ b/launcher2/src/saves.cpp
+@@ -151,6 +151,14 @@ std::string DeleteSavesJob(trg::Task& task, const GameInfo& game) {
+ std::string RemoveGameJob(trg::Task& task, const GameInfo& game) {
+   task.SetLabel(std::string("Removing ") + game.title);
+   std::error_code ec;
++  if (game.saves_folder) {  // the saves live inside the game folder: everything else goes
++    for (const auto& e : fs::directory_iterator(fs::u8path(GameDir(game)), ec)) {
++      if (e.path().filename() == fs::u8path(game.saves_folder)) continue;
++      fs::remove_all(e.path(), ec);
++      if (ec) return "Some files could not be removed (is the game running?).";
++    }
++    return std::string();
++  }
+   fs::remove_all(fs::u8path(GameDir(game)), ec);
+   if (ec) return "Some files could not be removed (is the game running?).";
+   return std::string();
+diff --git a/launcher2/src/settings_screen.cpp b/launcher2/src/settings_screen.cpp
+index 8c249dc..2fef69f 100644
+--- a/launcher2/src/settings_screen.cpp
++++ b/launcher2/src/settings_screen.cpp
+@@ -235,11 +235,98 @@ int RenderScaleFor(const std::string& mode, int output_height) {
+   return scale;
+ }
+ 
++// ------------------------------------------------------ a game's own rows ---
++// Key names for a game's own key rows (KeyRow): ReXGlue's, plus the modifier keys.
++std::string OwnKeyName(ImGuiKey k) {
++  switch (k) {
++    case ImGuiKey_LeftShift: return "LShift";
++    case ImGuiKey_RightShift: return "RShift";
++    case ImGuiKey_LeftCtrl: return "LCtrl";
++    case ImGuiKey_RightCtrl: return "RCtrl";
++    case ImGuiKey_LeftAlt: return "LAlt";
++    case ImGuiKey_RightAlt: return "RAlt";
++    default: return KeyName(k);
++  }
++}
++
++void DrawOwnRow(Rows& r, trg::SettingsStore& st, const SettingsSection& section, const SettingRow& row) {
++  if (row.show_key) {
++    std::string_view def;  // the other row's default: nothing is written before the first Play
++    for (const SettingRow& other : section.rows)
++      if (std::string_view(other.key) == row.show_key) def = other.def;
++    if (st.Get(row.show_key, def) != row.show_value) return;
++  }
++  switch (row.kind) {
++    case SettingRow::Kind::kHeading: r.Heading(row.label); break;
++    case SettingRow::Kind::kParagraph: r.Paragraph(row.label); break;
++    case SettingRow::Kind::kToggle: r.Toggle(row.label, row.help, row.key, std::string_view(row.def) == "true"); break;
++    case SettingRow::Kind::kSlider:
++      r.SliderInt(row.label, row.help, row.key, std::atoi(row.def), row.min, row.max, row.step, row.format);
++      break;
++    case SettingRow::Kind::kChoice: {
++      std::vector<Option> options;
++      for (const SettingOption& o : row.options) options.push_back({o.value, o.label});
++      r.Choice(row.label, row.help, row.key, row.def, options);
++      break;
++    }
++    case SettingRow::Kind::kResolution: {
++      static const int sizes[][2] = {{0, 0}, {1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
++      static const std::vector<std::string> names = {"Your screen", "1280 \xC3\x97 720", "1920 \xC3\x97 1080",
++                                                     "2560 \xC3\x97 1440", "3840 \xC3\x97 2160"};
++      const int w = st.GetInt("window_width", 1920), h = st.GetInt("window_height", 1080);
++      int cur = -1;
++      for (int i = 0; i < int(std::size(sizes)); ++i)
++        if (sizes[i][0] == w && sizes[i][1] == h) cur = i;
++      if (r.ChoiceIndex(row.label, row.help, cur, names, 2) && cur >= 0) {
++        st.SetInt("window_width", sizes[cur][0]);
++        st.SetInt("window_height", sizes[cur][1]);
++        st.Save();
++      }
++      break;
++    }
++    case SettingRow::Kind::kKey:
++      if (r.KeyBind(row.label, Pretty(st.Get(row.key, row.def)))) {
++        const char* key = row.key;
++        trg::SettingsStore* store = &st;
++        CaptureKey(row.label, [store, key](ImGuiKey k) {
++          const std::string name = OwnKeyName(k);
++          if (name.empty()) return false;
++          store->Set(key, name);
++          store->Save();
++          return true;
++        });
++      }
++      break;
++  }
++}
++
+ // --------------------------------------------------------- game sections ---
+ std::vector<Section> GameSections(App& app, int g) {
+   trg::SettingsStore& st = *app.game_ui(g).settings;
+   std::vector<Section> s;
+ 
++  if (!Games()[g].settings.empty()) {
++    for (const SettingsSection& section : Games()[g].settings)
++      s.push_back({section.name, [&st, &section](Rows& r) {
++        for (const SettingRow& row : section.rows) DrawOwnRow(r, st, section, row);
++        if (r.Button("Default settings", "Puts every setting in this section back to how it started.")) {
++          trg::SettingsStore* store = &st;
++          const SettingsSection* sec = &section;
++          Confirm(std::string(section.name) + ": default settings?", "Every setting in this section goes back to how it "
++                  "started.", "Reset", [store, sec] {
++                    for (const SettingRow& row : sec->rows) {
++                      if (row.kind == SettingRow::Kind::kResolution) {
++                        store->SetInt("window_width", 1920);
++                        store->SetInt("window_height", 1080);
++                      } else if (*row.key) {
++                        store->Set(row.key, row.def);
++                      }
++                    }
++                    store->Save();
++                  });
++        }
++      }});
++  } else {
+   s.push_back({"Display", [&st, g](Rows& r) {
+     r.Choice("Window mode", "Fullscreen fills your screen. Windowed opens a window you can move and resize.",
+              "fullscreen", "true", {{"true", "Fullscreen"}, {"false", "Windowed"}});
+@@ -400,8 +487,9 @@ std::vector<Section> GameSections(App& app, int g) {
+   s.push_back({"Audio", [](Rows& r) {
+     r.Toggle("Mute", "Turns all game sound off.", "audio_mute", false);
+   }});
++  }  // the sections for ReXGlue's runtime
+ 
+-  s.push_back({"Achievements", [&app, g](Rows& r) {
++  if (Project().features.achievements) s.push_back({"Achievements", [&app, g](Rows& r) {
+     if (app.state(g) != GameState::kInstalled) {
+       r.Paragraph("Install the game to see its achievements.");
+       return;
+@@ -469,7 +557,7 @@ std::vector<Section> GameSections(App& app, int g) {
+               [u, &game] { u->manage.Start("Deleting saves", [&game](trg::Task& t) { return DeleteSavesJob(t, game); }); });
+     }
+     r.Heading("INSTALL");
+-    const bool disc = game.source == InstallSource::kDisc;
++    const bool disc = IsDisc(game);
+     if (r.Button("Open the game folder", disc ? "The game's program files and the files from your disc."
+                                               : "The game's program files and the files from your copy."))
+       trg::OpenInFileManager(GameDir(game));
+@@ -490,7 +578,7 @@ std::vector<Section> GameSections(App& app, int g) {
+     }
+   }});
+ 
+-  s.push_back({"Updates", [&app, g](Rows& r) {
++  if (!Project().repo.empty()) s.push_back({"Updates", [&app, g](Rows& r) {
+     const GameInfo& game = Games()[g];
+     GameJobs& jobs = app.game_ui(g).jobs;
+     const std::string v = InstalledVersion(game);
+@@ -508,13 +596,15 @@ std::vector<Section> GameSections(App& app, int g) {
+     const GameInfo& game = Games()[g];
+     char id[16];
+     std::snprintf(id, sizeof id, "%08X", game.title_id);
+-    r.Paragraph(std::string(game.title) + " for PC, made by static recompilation of the Xbox 360 game. You need "
+-                "your own " + (game.source == InstallSource::kDisc ? "disc." : "copy of the game."));
++    const bool disc = IsDisc(game);
++    r.Paragraph(std::string(game.title) + " for PC, made by static recompilation of the " + Project().console +
++                " game. You need your own " + (disc ? "disc." : "copy of the game."));
+     r.Info("Game", game.title);
+-    r.Info("Xbox 360 title ID", id);
+-    r.Info("Media ID", game.media_id);
+-    r.Info(game.source == InstallSource::kDisc ? "Disc version" : "Game version", game.copy_version);
+-    r.Info(game.source == InstallSource::kDisc ? "Disc image" : "Package", std::string(game.copy_name) + ", " + game.copy_size);
++    if (game.source == InstallSource::kPs2Disc) r.Info(Project().console + " disc ID", game.disc_serial);
++    else r.Info(Project().console + " title ID", id);
++    if (*game.media_id) r.Info("Media ID", game.media_id);
++    r.Info(disc ? "Disc version" : "Game version", game.copy_version);
++    r.Info(disc ? "Disc image" : "Package", std::string(game.copy_name) + ", " + game.copy_size);
+     r.Info("SHA1", game.copy_sha1);
+     r.Info("MD5", game.copy_md5);
+     r.Info("CRC32", game.copy_crc32);
+@@ -531,18 +621,12 @@ std::vector<Section> GameSections(App& app, int g) {
+   return s;
+ }
+ 
+-const char* kGameSectionNames[] = {"Display",      "Graphics",          "Controller", "Keyboard and mouse", "Audio",
+-                                   "Achievements", "Saves and install", "Updates",    "About"};
+-
+ }  // namespace
+ 
+-int FindGameSection(const char* name) {
+-  int index = 0;
+-  for (const char* s : kGameSectionNames) {
+-    if (std::string_view(s) == "Controller" && !Project().features.controller_options) continue;  // not shown
+-    if (std::string(s) == name) return index;
+-    ++index;
+-  }
++int FindGameSection(App& app, int g, const char* name) {
++  const std::vector<Section> sections = GameSections(app, g);
++  for (size_t i = 0; i < sections.size(); ++i)
++    if (std::string_view(sections[i].name) == name) return int(i);
+   return -1;
+ }
+ 
+@@ -560,10 +644,12 @@ void DrawCollection(App& app) {
+   const trg::UpdaterConfig& cfg = app.self_updater();
+   std::vector<Section> s;
+   s.push_back({"General", [&app](Rows& r) {
+-    r.Toggle("Install game updates by themselves", "New versions of the games download and install when the "
+-             "launcher starts.", "auto_update", true);
+-    r.Toggle("Install launcher updates by themselves", "A new version of this launcher downloads when it starts, "
+-             "then it restarts into it.", "update_check", true);
++    if (!Project().repo.empty()) {
++      r.Toggle("Install game updates by themselves", "New versions of the games download and install when the "
++               "launcher starts.", "auto_update", true);
++      r.Toggle("Install launcher updates by themselves", "A new version of this launcher downloads when it starts, "
++               "then it restarts into it.", "update_check", true);
++    }
+     if (r.Toggle("Interface sounds", "Soft sounds as you move around the launcher.", "ui_sounds", true))
+       sound::SetEnabled(app.launcher_settings().GetBool("ui_sounds", true));
+     if (r.Toggle("Fullscreen", "The launcher fills the screen. F11 switches at any time.", "fullscreen", true)) {
+@@ -571,7 +657,7 @@ void DrawCollection(App& app) {
+       if (want != IsFullscreen(app.window())) SetFullscreen(app.window(), want);
+     }
+   }});
+-  s.push_back({"Updates", [&app, &up, &cfg](Rows& r) {
++  if (!Project().repo.empty()) s.push_back({"Updates", [&app, &up, &cfg](Rows& r) {
+     // The launcher's own updates (the TRG updater's state, kept by App::PollSelfUpdate).
+     r.Info("Version", Project().version);
+     if (up.task.running()) {
+diff --git a/src/ps2.cpp b/src/ps2.cpp
+new file mode 100644
+index 0000000..9e8781e
+--- /dev/null
++++ b/src/ps2.cpp
+@@ -0,0 +1,149 @@
++#include "trg/ps2.h"
++
++#include <algorithm>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <vector>
++
++#include "trg/platform.h"
++#include "utf8_path.h"
++
++namespace trg {
++namespace {
++
++namespace fs = std::filesystem;
++
++constexpr uint64_t kSector = 2048;
++constexpr int kMaxDepth = 16;
++
++using detail::Utf8Path;
++
++uint32_t Le32(const unsigned char* p) {
++  return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
++}
++
++struct Entry {
++  std::string path;  // "MODULES/IOPMAIN.IRX"
++  uint32_t sector = 0, size = 0;
++};
++
++class Disc {
++ public:
++  explicit Disc(const std::string& path) {
++    f_.open(Utf8Path(path), std::ios::binary);
++    unsigned char pvd[kSector];
++    if (!Read(16, pvd, kSector) || pvd[0] != 1 || std::memcmp(pvd + 1, "CD001", 5) != 0) return;
++    root_sector_ = Le32(pvd + 156 + 2);
++    root_size_ = Le32(pvd + 156 + 10);
++    ok_ = root_sector_ != 0 && root_size_ != 0;
++  }
++  bool ok() const { return ok_; }
++
++  bool Read(uint64_t sector, void* out, size_t size) {
++    f_.clear();
++    f_.seekg(std::streamoff(sector * kSector));
++    f_.read(static_cast<char*>(out), std::streamsize(size));
++    return size_t(f_.gcount()) == size;
++  }
++
++  // Every file on the disc, walking from the root directory.
++  void List(std::vector<Entry>& out) { Walk(root_sector_, root_size_, "", 0, out); }
++
++  std::string ReadFile(const Entry& e) {
++    std::string s(e.size, '\0');
++    return Read(e.sector, s.data(), e.size) ? s : std::string();
++  }
++
++ private:
++  void Walk(uint32_t sector, uint32_t size, const std::string& prefix, int depth, std::vector<Entry>& out) {
++    if (depth > kMaxDepth || size > (64u << 20)) return;
++    std::vector<unsigned char> d(size);
++    if (!Read(sector, d.data(), size)) return;
++    for (size_t i = 0; i + 33 < size;) {
++      const size_t len = d[i];
++      if (len == 0) {  // records never cross a sector: the rest of this one is empty
++        i = (i / kSector + 1) * kSector;
++        continue;
++      }
++      if (i + len > size) break;
++      const unsigned char* r = d.data() + i;
++      i += len;
++      const size_t name_len = r[32];
++      if (33 + name_len > len) continue;
++      std::string name(reinterpret_cast<const char*>(r + 33), name_len);
++      if (name_len == 1 && (name[0] == 0 || name[0] == 1)) continue;  // . and ..
++      if (const size_t semi = name.find(';'); semi != std::string::npos) name.resize(semi);
++      if (name.empty() || name == "." || name == "..") continue;
++      bool safe = true;
++      for (unsigned char c : name) safe = safe && c >= 0x20 && c != '/' && c != '\\' && c != ':';
++      if (!safe) continue;
++      const uint32_t extent = Le32(r + 2), bytes = Le32(r + 10);
++      if (r[25] & 2)
++        Walk(extent, bytes, prefix + name + "/", depth + 1, out);
++      else
++        out.push_back({prefix + name, extent, bytes});
++    }
++  }
++
++  std::ifstream f_;
++  uint32_t root_sector_ = 0, root_size_ = 0;
++  bool ok_ = false;
++};
++
++}  // namespace
++
++std::string ReadPs2Serial(const std::string& utf8_image) {
++  Disc disc(utf8_image);
++  if (!disc.ok()) return {};
++  std::vector<Entry> files;
++  disc.List(files);
++  for (const Entry& e : files) {
++    if (e.path != "SYSTEM.CNF" || e.size > 4096) continue;
++    const std::string cnf = disc.ReadFile(e);
++    const size_t boot = cnf.find("BOOT2");
++    if (boot == std::string::npos) return {};
++    const size_t slash = cnf.find('\\', boot);
++    if (slash == std::string::npos) return {};
++    std::string serial;
++    for (size_t i = slash + 1; i < cnf.size() && cnf[i] != ';' && cnf[i] != '\r' && cnf[i] != '\n'; ++i)
++      serial += cnf[i];
++    return serial;
++  }
++  return {};
++}
++
++std::string ExtractPs2Disc(Task& task, const std::string& utf8_image, const std::string& utf8_out_dir,
++                           uint64_t max_file_bytes) {
++  Disc disc(utf8_image);
++  if (!disc.ok()) return "That file is not a PlayStation 2 disc image.";
++  std::vector<Entry> files;
++  disc.List(files);
++  long long total = 0, done = 0;
++  for (const Entry& e : files)
++    if (e.size <= max_file_bytes) total += e.size;
++  std::vector<char> buf(1 << 20);
++  for (const Entry& e : files) {
++    if (e.size > max_file_bytes) continue;
++    if (task.cancelled()) return {};
++    const fs::path to = Utf8Path(utf8_out_dir) / Utf8Path(e.path);
++    std::error_code ec;
++    fs::create_directories(to.parent_path(), ec);
++    std::ofstream out(to, std::ios::binary | std::ios::trunc);
++    if (!out) return "Cannot write to the game folder.";
++    uint64_t sector = e.sector;
++    for (uint64_t left = e.size; left > 0;) {
++      const size_t n = size_t(std::min<uint64_t>(left, buf.size()));
++      if (!disc.Read(sector, buf.data(), n)) return "The disc image could not be read. It may be damaged.";
++      out.write(buf.data(), std::streamsize(n));
++      if (!out) return "Writing failed: is the disk full?";
++      sector += n / kSector;
++      left -= n;
++      done += (long long)n;
++      task.Progress(done, total);
++    }
++  }
++  return {};
++}
++
++}  // namespace trg
